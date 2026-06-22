@@ -4,7 +4,7 @@ services:
     container_name: tg-watchbot
     restart: unless-stopped
     ports:
-      - "8765:8765"
+      - "127.0.0.1:8765:8765"
     environment:
       WEB_PANEL_HOST: "0.0.0.0"
     volumes:

@@ -39,6 +39,7 @@ def install_import_stubs() -> None:
         "aiogram.client.default": ModuleType("aiogram.client.default"),
         "fastapi": ModuleType("fastapi"),
         "fastapi.responses": ModuleType("fastapi.responses"),
+        "qrcode": ModuleType("qrcode"),
     }
     modules["apscheduler.schedulers.asyncio"].AsyncIOScheduler = object
     modules["bs4"].BeautifulSoup = object
@@ -65,6 +66,7 @@ def install_import_stubs() -> None:
     modules["fastapi.responses"].HTMLResponse = object
     modules["fastapi.responses"].RedirectResponse = object
     modules["fastapi.responses"].PlainTextResponse = object
+    modules["qrcode"].make = lambda *args, **kwargs: SimpleNamespace(save=lambda *a, **k: None)
     modules["uvicorn"].Server = object
     modules["uvicorn"].Config = identity_factory
     sys.modules.update({name: sys.modules.get(name, module) for name, module in modules.items()})
@@ -267,6 +269,22 @@ class PanelHtmlContractTest(unittest.TestCase):
         self.assertIn("action=/login", html)
         self.assertIn("name=username", html)
         self.assertIn("name=password", html)
+        self.assertIn("data-theme-toggle", html)
+
+    def test_layout_includes_theme_toggle(self) -> None:
+        html = app.layout("测试", "<p>ok</p>")
+        self.assertIn("tg_watchbot_theme", html)
+        self.assertIn("data-theme-toggle", html)
+        self.assertIn("html[data-theme='dark']", html)
+
+    def test_panel_cookie_secure_follows_request_scheme(self) -> None:
+        old_value = os.environ.pop("WEB_PANEL_COOKIE_SECURE", None)
+        try:
+            self.assertFalse(app.panel_cookie_secure(SimpleNamespace(url=SimpleNamespace(scheme="http"))))
+            self.assertTrue(app.panel_cookie_secure(SimpleNamespace(url=SimpleNamespace(scheme="https"))))
+        finally:
+            if old_value is not None:
+                os.environ["WEB_PANEL_COOKIE_SECURE"] = old_value
 
     def test_monitor_form_keeps_backend_field_names(self) -> None:
         html = app.monitor_form_html()
@@ -288,6 +306,32 @@ class PanelHtmlContractTest(unittest.TestCase):
         ]:
             self.assertIn(expected, html)
 
+    def test_monitor_form_defaults_to_30_seconds_with_1_second_minimum(self) -> None:
+        html = app.monitor_form_html()
+        self.assertIn("最低 1，默认 30", html)
+        self.assertIn("min=1", html)
+        self.assertIn("value='30'", html)
+
+    def test_monitor_from_form_clamps_interval_to_one_second(self) -> None:
+        monitor = app.monitor_from_form(
+            None,
+            "测试",
+            "rss",
+            "https://example.com/feed",
+            0,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            True,
+            True,
+            False,
+            False,
+        )
+        self.assertEqual(1, monitor["interval_seconds"])
+
     def test_monitor_form_can_disable_telegram_notification(self) -> None:
         monitor = {
             "type": "rss",
@@ -301,13 +345,19 @@ class PanelHtmlContractTest(unittest.TestCase):
 
     def test_layout_groups_navigation_by_domain(self) -> None:
         html = app.layout("测试", "<p>ok</p>")
-        for expected in ["<b>消息</b>", "<b>监控</b>", "<b>配置</b>", "<b>系统</b>", "私聊广告拦截", "TG 群监听"]:
+        for expected in ["<b>常用</b>", "<b>转发</b>", "<b>设置</b>", "<b>系统</b>", "收件箱", "群监听"]:
             self.assertIn(expected, html)
 
     def test_inbox_copy_describes_two_way_conversation(self) -> None:
         source = Path("app.py").read_text(encoding="utf-8")
         self.assertIn("这里显示双向机器人对话记录", source)
         self.assertIn("管理员 -> 用户", source)
+
+    def test_settings_page_warns_about_public_bind(self) -> None:
+        source = Path("app.py").read_text(encoding="utf-8")
+        self.assertIn("公网提示", source)
+        self.assertIn("0.0.0.0", source)
+        self.assertIn("docker-compose.yml", source)
 
     def test_users_page_keeps_shared_settings_form(self) -> None:
         source = Path("app.py").read_text(encoding="utf-8")

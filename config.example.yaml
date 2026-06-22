@@ -20,7 +20,7 @@ monitors:
 - name: NodeSeek 新帖
   type: rss
   url: https://rss.nodeseek.com/
-  interval_seconds: 60
+  interval_seconds: 30
   keywords:
   - VPS
   - 优惠
@@ -38,7 +38,7 @@ monitors:
 - name: Linux.do 最新
   type: rss
   url: https://linux.do/latest.rss
-  interval_seconds: 60
+  interval_seconds: 30
   keywords:
   - API
   - 教程

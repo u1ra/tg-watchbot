@@ -121,7 +121,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 支持去重，避免同一条反复推送。
 - 支持屏蔽词、作者、分类过滤（YAML 高级配置）。
 - 单个监控可关闭 Telegram 推送，只记录到 Web 推送历史。
-- 默认最低监控间隔为 60 秒。
+- 默认监控间隔为 30 秒，最低可设为 1 秒；频率越高越容易被目标站限流。
 
 ![示例图片](https://pic.gongyichuren.de/file/1779287170665_17b7c8b4040d6334ea62a108d08db644.png)
 
@@ -133,6 +133,8 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 批量新增监控。
 - YAML 高级编辑。
 - Bot Token / 管理员 ID / 面板账号配置页。
+- 明亮 / 暗黑主题切换，主题选择保存在当前浏览器。
+- 设置页可修改面板监听地址和端口，并会提示公网监听风险。
 - 收件箱页面，可查看完整双向对话记录、重试转发、直接回复。
 - 用户管理页，可备注、封禁、解封、主动发消息，并可编辑 Bot / 面板配置。
 - 私聊广告拦截规则和快捷回复模板可在 Web 面板编辑。
@@ -170,7 +172,8 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 
 ## 安全说明
 
-- 如果要把面板暴露到公网，建议使用 Cloudflare Access / 反代鉴权，并使用强密码。
+- 默认建议只在本机访问面板；如果要公网访问，建议使用 Cloudflare Tunnel、Nginx/Caddy 反代鉴权，并使用强密码。
+- 监听地址填 `0.0.0.0` 会监听所有网卡；Docker 是否真正暴露公网还取决于端口映射和服务器防火墙。
 - Bot 只能给“已经主动私聊过 Bot 的用户”发消息，这是 Telegram Bot API 的限制。
 
 ## 快速开始
@@ -183,16 +186,18 @@ git clone https://github.com/GongyiChuren/tg-watchbot.git tg-watchbot
 cd tg-watchbot
 cp .env.example .env
 cp config.example.yaml config.yaml
+chmod 600 .env
 touch tg-watchbot.sqlite3 tg-watchbot.log
 docker compose up -d --build
 ```
 
-Docker 会在容器内监听 `0.0.0.0:8765`，宿主机打开 `http://127.0.0.1:8765` 即可访问面板。
+Docker 容器内会监听 `0.0.0.0:8765`，但 `docker-compose.yml` 默认只把端口绑定到宿主机 `127.0.0.1:8765`。宿主机打开 `http://127.0.0.1:8765` 即可访问面板。
 
 **⚠️ 注意事项：**
-- `.env.example` 里的 `WEB_PANEL_HOST` 默认为 `0.0.0.0`，Docker 容器内面板会监听所有网口。如果需要从外部访问（如公网 IP），请确保服务器防火墙/安全组已放行 `8765` 端口。
+- `.env.example` 里的 `WEB_PANEL_HOST` 默认为 `127.0.0.1`；Docker Compose 会覆盖为容器内可访问的 `0.0.0.0`。
+- 不建议直接把 `8765` 裸露到公网；如需公网访问，优先使用 Cloudflare Tunnel、Nginx/Caddy 反代鉴权或 SSH 隧道。
 - `.env` 文件会被容器挂载并写入（如 session secret），请勿设置为只读（`:ro`）。
-- 阿里云、腾讯云等云服务器需要在控制台的安全组/防火墙中手动放行端口，否则外部无法访问。
+- 如果你明确要直接公网访问，需要同时修改 `docker-compose.yml` 端口映射、服务器防火墙/安全组，并在面板里改强密码。
 
 查看状态与日志：
 
@@ -225,6 +230,7 @@ python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 cp .env.example .env
 cp config.example.yaml config.yaml
+chmod 600 .env
 ```
 
 启动：
@@ -247,6 +253,8 @@ http://127.0.0.1:8765
 ```
 
 登录后进入“设置”，填写 Bot Token、管理员 Telegram 数字 chat id、面板账号和密码。保存后重启服务，Bot 才会开始收发 Telegram 消息和发送监控通知。
+
+如需修改面板端口，在“设置”里调整 `WEB_PANEL_PORT` 并重启服务。手动部署默认只监听 `127.0.0.1`；如果改成 `0.0.0.0`，面板会监听所有网卡，请先确认反代鉴权或防火墙策略。
 
 手动跑一次监控：
 
@@ -341,11 +349,12 @@ curl http://127.0.0.1:8765/health
 | `ADMIN_CHAT_ID` | 管理员 Telegram 数字 chat id；最多 3 个，用逗号分隔 |
 | `LOG_LEVEL` | 日志级别，默认 `INFO` |
 | `WEB_PANEL_ENABLED` | 是否启用 Web 面板，默认 `true` |
-| `WEB_PANEL_HOST` | 面板监听地址，默认 `127.0.0.1` |
-| `WEB_PANEL_PORT` | 面板端口，默认 `8765` |
+| `WEB_PANEL_HOST` | 面板监听地址，默认 `127.0.0.1`；Docker Compose 会在容器内覆盖为 `0.0.0.0` |
+| `WEB_PANEL_PORT` | 面板端口，默认 `8765`；修改后需重启 |
 | `WEB_PANEL_USER` | 面板用户名 |
 | `WEB_PANEL_PASSWORD` | 面板密码 |
 | `WEB_PANEL_SESSION_SECRET` | Session Secret，留空会自动生成并写回 `.env` |
+| `WEB_PANEL_COOKIE_SECURE` | 留空时按 HTTPS 自动判断；特殊反代场景可手动设为 `true` / `false` |
 | `TG_API_ID` | （可选）Telegram API ID，用于“TG 群监听=用户会话” |
 | `TG_API_HASH` | （可选）Telegram API Hash，用于“TG 群监听=用户会话” |
 | `TG_API_SESSION` | （可选）Telethon StringSession，用于“TG 群监听=用户会话” |
@@ -449,7 +458,7 @@ monitors:
   - name: NodeSeek 新帖
     type: rss
     url: https://rss.nodeseek.com/
-    interval_seconds: 60
+    interval_seconds: 30
     keywords:
       - VPS
       - 优惠
@@ -540,8 +549,8 @@ monitors:
 ## 注意事项
 
 - Telegram Bot 不能主动私聊陌生人；对方必须先给 Bot 发过 `/start` 或任意消息。
-- 对公网暴露 Web 面板前，务必改默认密码。
-- RSS 监控建议 60 秒起步；网页监控建议更保守，避免对目标站造成压力。
+- 对公网暴露 Web 面板前，务必改默认密码，并优先使用反代鉴权或 Tunnel。
+- RSS/Web 监控最低可设 1 秒，默认 30 秒；实际部署建议按目标站承受能力调高，避免被限流。
 - 媒体消息当前只保证记录文本/说明和转发状态；转发失败后的媒体补发需要额外做本地附件存储。
 
 ## License

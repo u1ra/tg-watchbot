@@ -62,7 +62,8 @@ DB_PATH = BASE_DIR / "tg-watchbot.sqlite3"
 CONFIG_PATH = BASE_DIR / "config.yaml"
 ENV_PATH = BASE_DIR / ".env"
 LOG_PATH = BASE_DIR / "tg-watchbot.log"
-MIN_INTERVAL_SECONDS = 60
+MIN_INTERVAL_SECONDS = 1
+DEFAULT_MONITOR_INTERVAL_SECONDS = 30
 DEFAULT_MONITOR_MESSAGE_DELETE_AFTER_MINUTES = 60
 DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS = 30
 DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS = 300
@@ -2499,7 +2500,7 @@ async def run_all_monitors_once() -> None:
 def schedule_monitors(scheduler: AsyncIOScheduler) -> None:
     for idx, m in enumerate(config.get("monitors") or []):
         name = m.get("name", "unnamed")
-        requested = int(m.get("interval_seconds", MIN_INTERVAL_SECONDS))
+        requested = int(m.get("interval_seconds", DEFAULT_MONITOR_INTERVAL_SECONDS))
         interval = max(requested, MIN_INTERVAL_SECONDS)
         if requested < MIN_INTERVAL_SECONDS:
             logger.warning("monitor %s interval %s raised to %s", name, requested, interval)
@@ -2539,9 +2540,61 @@ def is_logged_in(request: Request) -> bool:
     return bool(token) and secrets.compare_digest(token, session_token(username))
 
 
+def panel_cookie_secure(request: Request) -> bool:
+    forced = os.getenv("WEB_PANEL_COOKIE_SECURE", "").strip().lower()
+    if forced in {"1", "true", "yes", "on"}:
+        return True
+    if forced in {"0", "false", "no", "off"}:
+        return False
+    return str(request.url.scheme).lower() == "https"
+
+
 def panel_auth(request: Request) -> str:
     # Actual redirect is handled by middleware; dependencies cannot reliably return redirects.
     return os.getenv("WEB_PANEL_USER", "admin")
+
+
+def theme_boot_script() -> str:
+    return """<script>
+(function(){
+  try {
+    var saved = localStorage.getItem('tg_watchbot_theme');
+    document.documentElement.dataset.theme = saved === 'dark' ? 'dark' : 'light';
+  } catch (e) {
+    document.documentElement.dataset.theme = 'light';
+  }
+})();
+</script>"""
+
+
+def theme_interaction_script() -> str:
+    return """<script>
+(function(){
+  function syncThemeButtons() {
+    var dark = document.documentElement.dataset.theme === 'dark';
+    document.querySelectorAll('[data-theme-toggle]').forEach(function(btn) {
+      btn.textContent = dark ? '亮' : '暗';
+      btn.title = dark ? '切换到明亮主题' : '切换到暗黑主题';
+      btn.setAttribute('aria-label', btn.title);
+    });
+  }
+  window.toggleTheme = function() {
+    var next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem('tg_watchbot_theme', next); } catch (e) {}
+    syncThemeButtons();
+  };
+  document.addEventListener('mousemove', function(event) {
+    if (document.documentElement.dataset.theme !== 'dark') return;
+    var target = event.target.closest('.card,.step,nav section');
+    if (!target) return;
+    var rect = target.getBoundingClientRect();
+    target.style.setProperty('--mx', (event.clientX - rect.left) + 'px');
+    target.style.setProperty('--my', (event.clientY - rect.top) + 'px');
+  });
+  syncThemeButtons();
+})();
+</script>"""
 
 
 def login_page(error: str = "") -> str:
@@ -2549,8 +2602,10 @@ def login_page(error: str = "") -> str:
     return f"""<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>
 <title>登录 · tg-watchbot</title>
 <link rel=icon href="{app_icon_data_uri()}">
+{theme_boot_script()}
 <style>
 :root{{color-scheme:light;--canvas:#f0f0f0;--ink:#121212;--muted:#5c5c5c;--red:#d02020;--blue:#1040c0;--yellow:#f0c020;--white:#fff;--ease:cubic-bezier(.2,.8,.2,1)}}
+html[data-theme='dark']{{color-scheme:dark;--canvas:#050506;--ink:#EDEDEF;--muted:#8A8F98;--red:#ff6363;--blue:#5E6AD2;--yellow:#d7c56b;--white:rgba(255,255,255,.055)}}
 *{{box-sizing:border-box}}
 body{{margin:0;min-height:100vh;font-family:Outfit,Aptos,'Segoe UI',sans-serif;background:var(--canvas);color:var(--ink);display:grid;place-items:center;padding:24px;overflow:hidden}}
 body:before{{content:"";position:fixed;inset:auto auto -90px -70px;width:220px;height:220px;border:4px solid var(--ink);border-radius:50%;background:var(--yellow);z-index:-1;animation:floatA 5.5s var(--ease) infinite alternate}}
@@ -2570,15 +2625,27 @@ input:focus{{transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--blue)}}
 button{{width:100%;margin-top:22px;border:3px solid var(--ink);border-radius:0;padding:12px 16px;background:var(--red);color:white;font-weight:900;font-size:14px;text-transform:uppercase;letter-spacing:.08em;cursor:pointer;box-shadow:4px 4px 0 var(--ink);transition:transform .16s var(--ease),background-color .16s var(--ease);will-change:transform}}
 button:hover{{transform:translate(-1px,-1px);background:#bc1c1c}}
 button:active{{transform:translate(2px,2px)}}
+.theme-toggle{{position:fixed;right:20px;top:20px;width:40px;height:40px;margin:0;padding:0;border-radius:8px;background:var(--white);color:var(--ink);z-index:2}}
 .login-error{{background:#fff;border:3px solid var(--ink);color:var(--red);padding:10px 12px;margin-bottom:16px;font-weight:800;box-shadow:4px 4px 0 var(--red)}}
 .foot{{margin-top:18px;color:var(--muted);font-size:13px;text-align:center;font-weight:700}}
+html[data-theme='dark'] body{{background:radial-gradient(ellipse at top,#121426 0%,#050506 54%,#020203 100%)}}
+html[data-theme='dark'] body:before{{inset:-180px auto auto -160px;width:560px;height:560px;border:0;background:rgba(94,106,210,.24);filter:blur(100px)}}
+html[data-theme='dark'] body:after{{top:auto;right:-180px;bottom:-150px;width:520px;height:520px;border:0;border-radius:50%;background:rgba(104,114,217,.18);filter:blur(95px)}}
+html[data-theme='dark'] .login-card{{border:1px solid rgba(255,255,255,.08);border-radius:8px;background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.035));box-shadow:0 0 0 1px rgba(255,255,255,.04),0 22px 70px rgba(0,0,0,.55),0 0 90px rgba(94,106,210,.12);backdrop-filter:blur(18px)}}
+html[data-theme='dark'] .login-card:after{{display:none}}
+html[data-theme='dark'] .logo,html[data-theme='dark'] input,html[data-theme='dark'] button{{border-color:rgba(255,255,255,.10);box-shadow:0 0 0 1px rgba(255,255,255,.04),0 10px 30px rgba(0,0,0,.35)}}
+html[data-theme='dark'] input{{background:#0f0f12}}
+html[data-theme='dark'] input:focus{{box-shadow:0 0 0 3px rgba(94,106,210,.25),0 0 32px rgba(94,106,210,.18)}}
+html[data-theme='dark'] button{{background:var(--blue)}}
+html[data-theme='dark'] button:hover{{background:#6872D9}}
+html[data-theme='dark'] .theme-toggle{{background:rgba(255,255,255,.06)}}
 @keyframes cardIn{{from{{opacity:.0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}
 @keyframes floatA{{from{{transform:translateY(0)}}to{{transform:translateY(-8px)}}}}
 @keyframes floatB{{from{{transform:rotate(12deg) translateY(0)}}to{{transform:rotate(12deg) translateY(-9px)}}}}
 @media (prefers-reduced-motion: reduce){{
   *,*::before,*::after{{animation:none!important;transition:none!important}}
 }}
-</style></head><body><main class=login-card><div class=logo><i></i></div><h1>tg-watchbot</h1><p>登录后管理 Telegram 机器人、关键词监控和提醒。</p>{err}<form method=post action=/login><label>用户名</label><input name=username autocomplete=username autofocus><label>密码</label><input name=password type=password autocomplete=current-password><button type=submit>登录面板</button></form><div class=foot>localhost panel</div></main></body></html>"""
+</style></head><body><button class=theme-toggle type=button data-theme-toggle onclick='toggleTheme()' aria-label='切换暗黑主题' title='切换暗黑主题'>暗</button><main class=login-card><div class=logo><i></i></div><h1>tg-watchbot</h1><p>登录后管理 Telegram 机器人、关键词监控和提醒。</p>{err}<form method=post action=/login><label>用户名</label><input name=username autocomplete=username autofocus><label>密码</label><input name=password type=password autocomplete=current-password><button type=submit>登录面板</button></form><div class=foot>localhost panel</div></main>{theme_interaction_script()}</body></html>"""
 
 
 def env_values() -> dict[str, str]:
@@ -2593,6 +2660,7 @@ def env_values() -> dict[str, str]:
         "WEB_PANEL_USER": os.getenv("WEB_PANEL_USER", "admin"),
         "WEB_PANEL_PASSWORD": os.getenv("WEB_PANEL_PASSWORD", "admin"),
         "WEB_PANEL_SESSION_SECRET": os.getenv("WEB_PANEL_SESSION_SECRET", ""),
+        "WEB_PANEL_COOKIE_SECURE": os.getenv("WEB_PANEL_COOKIE_SECURE", ""),
         "TG_API_ID": os.getenv("TG_API_ID", ""),
         "TG_API_HASH": os.getenv("TG_API_HASH", ""),
         "TG_API_SESSION": os.getenv("TG_API_SESSION", ""),
@@ -2608,6 +2676,9 @@ def write_env_values(values: dict[str, str]) -> None:
                 key, value = line.split("=", 1)
                 existing[key.strip()] = value.strip()
     session_value = values.get("WEB_PANEL_SESSION_SECRET") or existing.get("WEB_PANEL_SESSION_SECRET", "")
+    cookie_secure_value = values.get("WEB_PANEL_COOKIE_SECURE")
+    if cookie_secure_value is None:
+        cookie_secure_value = existing.get("WEB_PANEL_COOKIE_SECURE", "")
     lines = [
         "# tg-watchbot environment",
         f"TELEGRAM_BOT_TOKEN={values.get('TELEGRAM_BOT_TOKEN','')}",
@@ -2621,6 +2692,7 @@ def write_env_values(values: dict[str, str]) -> None:
         f"WEB_PANEL_USER={values.get('WEB_PANEL_USER','admin')}",
         f"WEB_PANEL_PASSWORD={values.get('WEB_PANEL_PASSWORD','admin')}",
         f"WEB_PANEL_SESSION_SECRET={session_value}",
+        f"WEB_PANEL_COOKIE_SECURE={cookie_secure_value}",
         f"TG_API_ID={values.get('TG_API_ID','')}",
         f"TG_API_HASH={values.get('TG_API_HASH','')}",
         f"TG_API_SESSION={values.get('TG_API_SESSION','')}",
@@ -2645,7 +2717,7 @@ def cfg_save(new_cfg: dict[str, Any]) -> None:
     for m in monitors:
         if not isinstance(m, dict):
             raise ValueError("每个 monitor 必须是对象")
-        if int(m.get("interval_seconds", MIN_INTERVAL_SECONDS)) < MIN_INTERVAL_SECONDS:
+        if int(m.get("interval_seconds", DEFAULT_MONITOR_INTERVAL_SECONDS)) < MIN_INTERVAL_SECONDS:
             m["interval_seconds"] = MIN_INTERVAL_SECONDS
     group_monitor_rows = new_cfg.get("group_monitors") or []
     if group_monitor_rows is not None and not isinstance(group_monitor_rows, list):
@@ -2801,7 +2873,10 @@ def monitor_from_form(
         "name": name.strip(),
         "type": mtype,
         "url": url.strip(),
-        "interval_seconds": max(int(interval_seconds or MIN_INTERVAL_SECONDS), MIN_INTERVAL_SECONDS),
+        "interval_seconds": max(
+            int(DEFAULT_MONITOR_INTERVAL_SECONDS if interval_seconds is None else interval_seconds),
+            MIN_INTERVAL_SECONDS,
+        ),
         "keywords": parse_lines(keywords),
         "notify_telegram": notify_telegram,
         "notify_on": {
@@ -2833,8 +2908,10 @@ def layout(title: str, body: str) -> str:
     return f"""<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>
 <title>{html_escape(title)} · tg-watchbot</title>
 <link rel=icon href="{app_icon_data_uri()}">
+{theme_boot_script()}
 <style>
-:root{{--canvas:#f0f0f0;--ink:#121212;--muted:#5c5c5c;--red:#d02020;--blue:#1040c0;--yellow:#f0c020;--white:#fff;--gray:#e0e0e0;--ease:cubic-bezier(.2,.8,.2,1)}}
+:root{{color-scheme:light;--canvas:#f0f0f0;--ink:#121212;--muted:#5c5c5c;--red:#d02020;--blue:#1040c0;--yellow:#f0c020;--white:#fff;--gray:#e0e0e0;--ease:cubic-bezier(.2,.8,.2,1)}}
+html[data-theme='dark']{{color-scheme:dark;--canvas:#050506;--ink:#EDEDEF;--muted:#8A8F98;--red:#ff6363;--blue:#5E6AD2;--yellow:#d7c56b;--white:rgba(255,255,255,.055);--gray:rgba(255,255,255,.08)}}
 *{{box-sizing:border-box}}
 body{{font-family:Outfit,Aptos,'Segoe UI',sans-serif;background:var(--canvas);color:var(--ink);margin:0;letter-spacing:0;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}}
 body:before{{content:"";position:fixed;right:-70px;top:110px;width:190px;height:190px;border:4px solid var(--ink);border-radius:50%;background:var(--yellow);z-index:-1;animation:floatA 7s var(--ease) infinite alternate}}
@@ -2865,7 +2942,9 @@ nav a:active{{transform:translate(1px,1px);box-shadow:1px 1px 0 var(--ink)}}
 .logout{{background:var(--red)!important;color:white}}
 .top{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:20px;border-bottom:4px solid var(--ink);padding-bottom:14px}}
 .top h1{{margin:0;font-size:34px;line-height:.95;color:var(--ink);font-weight:900;text-transform:uppercase}}
+.top-actions{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
 .top .badge{{background:var(--blue);color:white}}
+.theme-toggle{{width:36px;height:36px;padding:0;border-radius:8px;display:inline-grid;place-items:center}}
 .btn{{background:var(--white);color:var(--ink);padding:7px 11px;border:3px solid var(--ink);border-radius:0;display:inline-block;cursor:pointer;font-weight:900;line-height:1.35;text-transform:uppercase;font-size:12px;box-shadow:3px 3px 0 var(--ink);transition:transform .14s var(--ease),box-shadow .14s var(--ease),background-color .14s var(--ease);will-change:transform}}
 .btn:hover{{text-decoration:none;transform:translate(-1px,-1px);box-shadow:5px 5px 0 var(--ink)}}
 .btn:active{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}
@@ -2904,6 +2983,26 @@ pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px 
 .friend-links{{margin-top:18px;padding-top:12px;border-top:3px solid var(--ink);display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
 .friend-links b{{font-size:12px;font-weight:900;text-transform:uppercase}}
 .friend-links a{{font-weight:900}}
+html[data-theme='dark'] body{{background:radial-gradient(ellipse at top,#121426 0%,#050506 52%,#020203 100%)}}
+html[data-theme='dark'] body:before{{right:-210px;top:-180px;width:680px;height:680px;border:0;background:rgba(94,106,210,.22);filter:blur(120px);animation:floatA 10s var(--ease) infinite alternate}}
+html[data-theme='dark'] body:after{{left:-190px;bottom:-210px;width:620px;height:620px;border:0;border-radius:50%;background:rgba(104,114,217,.14);filter:blur(110px);animation:floatB 11s var(--ease) infinite alternate}}
+html[data-theme='dark'] body{{background-image:radial-gradient(ellipse at top,#121426 0%,#050506 52%,#020203 100%),linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.018) 1px,transparent 1px);background-size:auto,64px 64px,64px 64px}}
+html[data-theme='dark'] aside,html[data-theme='dark'] .card,html[data-theme='dark'] .step,html[data-theme='dark'] nav section{{position:relative;overflow:hidden;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.035));box-shadow:0 0 0 1px rgba(255,255,255,.035),0 18px 55px rgba(0,0,0,.42),0 0 70px rgba(94,106,210,.08);backdrop-filter:blur(18px)}}
+html[data-theme='dark'] .card:before,html[data-theme='dark'] .step:before,html[data-theme='dark'] nav section:before{{content:"";position:absolute;inset:0;z-index:0;background:radial-gradient(320px circle at var(--mx,50%) var(--my,0),rgba(94,106,210,.18),transparent 60%);opacity:0;transition:opacity .22s var(--ease);pointer-events:none}}
+html[data-theme='dark'] .card:hover:before,html[data-theme='dark'] .step:hover:before,html[data-theme='dark'] nav section:hover:before{{opacity:1}}
+html[data-theme='dark'] .card>*,html[data-theme='dark'] .step>*,html[data-theme='dark'] nav section>*{{position:relative;z-index:1}}
+html[data-theme='dark'] .card:after{{display:none}}
+html[data-theme='dark'] .brand,html[data-theme='dark'] .top,html[data-theme='dark'] h3,html[data-theme='dark'] .friend-links{{border-color:rgba(255,255,255,.08)}}
+html[data-theme='dark'] nav a,html[data-theme='dark'] .btn,html[data-theme='dark'] input,html[data-theme='dark'] select,html[data-theme='dark'] textarea,html[data-theme='dark'] table,html[data-theme='dark'] td,html[data-theme='dark'] th,html[data-theme='dark'] .badge,html[data-theme='dark'] .check-row label,html[data-theme='dark'] .msg,html[data-theme='dark'] .mark,html[data-theme='dark'] .step-no{{border-color:rgba(255,255,255,.10);box-shadow:0 0 0 1px rgba(255,255,255,.035),0 10px 28px rgba(0,0,0,.28)}}
+html[data-theme='dark'] nav a,html[data-theme='dark'] .btn,html[data-theme='dark'] input,html[data-theme='dark'] select,html[data-theme='dark'] textarea{{border-radius:8px;background:rgba(255,255,255,.055)}}
+html[data-theme='dark'] nav a:hover,html[data-theme='dark'] .btn:hover{{box-shadow:0 0 0 1px rgba(255,255,255,.08),0 12px 32px rgba(0,0,0,.36),0 0 34px rgba(94,106,210,.15)}}
+html[data-theme='dark'] .btn.primary,html[data-theme='dark'] .btn.danger,html[data-theme='dark'] .top .badge{{background:var(--blue);color:#fff;box-shadow:0 0 0 1px rgba(94,106,210,.45),0 8px 24px rgba(94,106,210,.22),inset 0 1px 0 rgba(255,255,255,.16)}}
+html[data-theme='dark'] .btn.ok,html[data-theme='dark'] .step-no,html[data-theme='dark'] nav section>b{{background:rgba(94,106,210,.16);color:var(--ink)}}
+html[data-theme='dark'] input:focus,html[data-theme='dark'] select:focus,html[data-theme='dark'] textarea:focus{{box-shadow:0 0 0 3px rgba(94,106,210,.24),0 0 32px rgba(94,106,210,.18);border-color:rgba(94,106,210,.55)}}
+html[data-theme='dark'] table,html[data-theme='dark'] tr:nth-child(even) td{{background:rgba(255,255,255,.035)}}
+html[data-theme='dark'] th{{background:rgba(94,106,210,.18)}}
+html[data-theme='dark'] .msg{{background:rgba(215,197,107,.13);color:var(--ink)}}
+html[data-theme='dark'] pre{{background:#09090b;border-color:rgba(255,255,255,.08);box-shadow:0 16px 45px rgba(0,0,0,.38)}}
 @keyframes mainIn{{from{{opacity:.0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}
 @keyframes floatA{{from{{transform:translateY(0)}}to{{transform:translateY(-8px)}}}}
 @keyframes floatB{{from{{transform:rotate(45deg) translateY(0)}}to{{transform:rotate(45deg) translateY(-10px)}}}}
@@ -2918,12 +3017,12 @@ pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px 
 @media (prefers-reduced-motion: reduce){{
   *,*::before,*::after{{animation:none!important;transition:none!important}}
 }}
-</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>常用</b><a href='/'>总览</a><a href='/inbox'>收件箱</a><a href='/users'>用户</a><a href='/send'>发消息</a></section><section><b>转发</b><a href='/group-monitors'>群监听</a><a href='/monitor/events'>历史</a></section><section><b>设置</b><a href='/settings'>面板设置</a><a href='/yaml'>YAML</a><a href='/config/export'>导入导出</a></section><section><b>系统</b><a href='/update'>更新</a><a href='/logs'>日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启</a><a class=logout href='/logout'>退出</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
-{body}<div class=friend-links><b>友链</b><a href='https://linux.do' target='_blank' rel='noopener noreferrer'>Linux.do</a><span>·</span><a href='https://www.nodeseek.com' target='_blank' rel='noopener noreferrer'>NodeSeek</a></div></main></div></body></html>"""
+</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>常用</b><a href='/'>总览</a><a href='/inbox'>收件箱</a><a href='/users'>用户</a><a href='/send'>发消息</a></section><section><b>转发</b><a href='/group-monitors'>群监听</a><a href='/monitor/events'>历史</a></section><section><b>设置</b><a href='/settings'>面板设置</a><a href='/yaml'>YAML</a><a href='/config/export'>导入导出</a></section><section><b>系统</b><a href='/update'>更新</a><a href='/logs'>日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启</a><a class=logout href='/logout'>退出</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><div class=top-actions><button class='btn theme-toggle' type=button data-theme-toggle onclick='toggleTheme()' aria-label='切换暗黑主题' title='切换暗黑主题'>暗</button><span class=badge>WatchBot Panel</span></div></div>
+{body}<div class=friend-links><b>友链</b><a href='https://linux.do' target='_blank' rel='noopener noreferrer'>Linux.do</a><span>·</span><a href='https://www.nodeseek.com' target='_blank' rel='noopener noreferrer'>NodeSeek</a></div></main></div>{theme_interaction_script()}</body></html>"""
 
 
 def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -> str:
-    m = m or {"type": "web", "interval_seconds": 60, "notify_on": {"keyword_match": True, "new_item": True, "price_change": True, "stock_change": True}, "selectors": {}}
+    m = m or {"type": "web", "interval_seconds": DEFAULT_MONITOR_INTERVAL_SECONDS, "notify_on": {"keyword_match": True, "new_item": True, "price_change": True, "stock_change": True}, "selectors": {}}
     selectors = m.get("selectors") or {}
     no = m.get("notify_on") or {}
     keywords = "\n".join(m.get("keywords") or [])
@@ -2935,7 +3034,7 @@ def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -
 <div class=grid><div><label>名称</label><input name=name value='{html_escape(m.get('name',''))}' required></div>
 <div><label>类型</label><select name=mtype><option value=web {'selected' if m.get('type')=='web' else ''}>Web 网页</option><option value=rss {'selected' if m.get('type')=='rss' else ''}>RSS</option></select></div>
 <div><label>URL</label><input name=url value='{html_escape(m.get('url',''))}' required></div>
-<div><label>间隔秒数（最低 60）</label><input name=interval_seconds type=number min=60 value='{html_escape(m.get('interval_seconds',60))}'></div></div>
+<div><label>间隔秒数（最低 1，默认 30）</label><input name=interval_seconds type=number min=1 value='{html_escape(m.get('interval_seconds', DEFAULT_MONITOR_INTERVAL_SECONDS))}'></div></div>
 <label>关键词（一行一个）</label><textarea name=keywords>{html_escape(keywords)}</textarea>
 <h3>Web 选择器（RSS 可忽略）</h3><div class=grid>
 <div><label>条目选择器</label><input name=item_selector value='{html_escape(selectors.get('item','article, .thread, .post, li'))}'></div>
@@ -3009,12 +3108,12 @@ def create_panel_app() -> FastAPI:
         return HTMLResponse(login_page())
 
     @app.post("/login")
-    async def login_post(username: str = Form(""), password: str = Form("")):
+    async def login_post(request: Request, username: str = Form(""), password: str = Form("")):
         expected_user = os.getenv("WEB_PANEL_USER", "admin")
         expected_pass = os.getenv("WEB_PANEL_PASSWORD", "admin")
         if secrets.compare_digest(username, expected_user) and secrets.compare_digest(password, expected_pass):
             resp = RedirectResponse("/", status_code=303)
-            resp.set_cookie("tg_watchbot_session", session_token(expected_user), httponly=True, secure=True, samesite="lax", max_age=60 * 60 * 24 * 14)
+            resp.set_cookie("tg_watchbot_session", session_token(expected_user), httponly=True, secure=panel_cookie_secure(request), samesite="lax", max_age=60 * 60 * 24 * 14)
             return resp
         return HTMLResponse(login_page("用户名或密码错误"), status_code=401)
 
@@ -3042,7 +3141,7 @@ def create_panel_app() -> FastAPI:
                 )
                 if st.get("last_error"):
                     st_line += f"<br><small>{html_escape(str(st.get('last_error'))[:100])}</small>"
-            rows.append(f"""<tr><td><span class=badge>{html_escape(m.get('type','web'))}</span></td><td><b>{html_escape(name)}</b><br><small>{html_escape(m.get('url',''))}</small></td><td>{html_escape(m.get('interval_seconds',60))}s<br><small>{tg}</small></td><td>{html_escape(', '.join(m.get('keywords') or []))}</td><td>{st_line}</td><td><a class=btn href='/monitor/{i}/edit'>编辑</a> <a class='btn ok' href='/monitor/{i}/preview'>预览</a> <a class='btn ok' href='/monitor/{i}/run'>检查</a> <a class='btn danger' href='/monitor/{i}/delete' onclick='return confirm("确定删除？")'>删除</a></td></tr>""")
+            rows.append(f"""<tr><td><span class=badge>{html_escape(m.get('type','web'))}</span></td><td><b>{html_escape(name)}</b><br><small>{html_escape(m.get('url',''))}</small></td><td>{html_escape(m.get('interval_seconds', DEFAULT_MONITOR_INTERVAL_SECONDS))}s<br><small>{tg}</small></td><td>{html_escape(', '.join(m.get('keywords') or []))}</td><td>{st_line}</td><td><a class=btn href='/monitor/{i}/edit'>编辑</a> <a class='btn ok' href='/monitor/{i}/preview'>预览</a> <a class='btn ok' href='/monitor/{i}/run'>检查</a> <a class='btn danger' href='/monitor/{i}/delete' onclick='return confirm("确定删除？")'>删除</a></td></tr>""")
         body = f"""<div class=card><div class=toolbar><div><h2 style='margin:0 0 6px'>监控目标</h2><p class=muted style='margin:0'>当前 {len(cfg.get('monitors') or [])} 个；保存后自动重载定时任务。</p></div><div class=actions><a class='btn' href='/monitor/templates'>论坛模板</a> <a class='btn primary' href='/monitor/new'>新增监控</a> <a class='btn ok' href='/monitor/bulk'>批量新增</a></div></div><table style='margin-top:16px'><tr><th>类型</th><th>目标</th><th>间隔/通知</th><th>关键词</th><th>运行状态</th><th>操作</th></tr>""" + "".join(rows) + "</table></div>"
         return layout("监控", body)
 
@@ -3305,9 +3404,9 @@ def create_panel_app() -> FastAPI:
     @app.get("/monitor/template/{kind}", response_class=HTMLResponse)
     async def monitor_template(kind: str, _: str = Depends(panel_auth)) -> str:
         templates = {
-            "nodeseek": {"name": "NodeSeek 新帖", "type": "rss", "url": "https://rss.nodeseek.com/", "interval_seconds": 60, "keywords": ["NAT", "优惠", "补货", "VPS", "免费"], "forum": True, "notify_on": {"keyword_match": True, "new_item": True, "price_change": False, "stock_change": False}},
-            "linuxdo": {"name": "Linux.do 最新", "type": "rss", "url": "https://linux.do/latest.rss", "interval_seconds": 60, "keywords": ["Claude", "Codex", "API", "VPS", "NAT"], "forum": True, "notify_on": {"keyword_match": True, "new_item": True, "price_change": False, "stock_change": False}},
-            "linuxdo-resource": {"name": "Linux.do 资源荟萃", "type": "rss", "url": "https://linux.do/c/resource/14.rss", "interval_seconds": 60, "keywords": ["免费", "开源", "API", "Claude"], "forum": True, "notify_on": {"keyword_match": True, "new_item": True, "price_change": False, "stock_change": False}},
+            "nodeseek": {"name": "NodeSeek 新帖", "type": "rss", "url": "https://rss.nodeseek.com/", "interval_seconds": DEFAULT_MONITOR_INTERVAL_SECONDS, "keywords": ["NAT", "优惠", "补货", "VPS", "免费"], "forum": True, "notify_on": {"keyword_match": True, "new_item": True, "price_change": False, "stock_change": False}},
+            "linuxdo": {"name": "Linux.do 最新", "type": "rss", "url": "https://linux.do/latest.rss", "interval_seconds": DEFAULT_MONITOR_INTERVAL_SECONDS, "keywords": ["Claude", "Codex", "API", "VPS", "NAT"], "forum": True, "notify_on": {"keyword_match": True, "new_item": True, "price_change": False, "stock_change": False}},
+            "linuxdo-resource": {"name": "Linux.do 资源荟萃", "type": "rss", "url": "https://linux.do/c/resource/14.rss", "interval_seconds": DEFAULT_MONITOR_INTERVAL_SECONDS, "keywords": ["免费", "开源", "API", "Claude"], "forum": True, "notify_on": {"keyword_match": True, "new_item": True, "price_change": False, "stock_change": False}},
         }
         m = templates.get(kind)
         if not m:
@@ -3319,11 +3418,11 @@ def create_panel_app() -> FastAPI:
         sample = """NodeSeek|https://www.nodeseek.com/|免费鸡,优惠码,NAT
 Linux.do|https://linux.do|公益,codex,claude
 HostLoc|https://hostloc.com|VPS,补货,优惠"""
-        body = f"""<div class=card><h2>批量新增监控</h2><p class=muted>一行一个网站，格式：<code>名称|URL|关键词1,关键词2,关键词3</code>。</p><form method=post action='/monitor/bulk'><label>批量列表</label><textarea name=items style='min-height:260px' placeholder='{html_escape(sample)}'></textarea><div class=grid><div><label>类型</label><select name=mtype><option value=web>Web 网页</option><option value=rss>RSS</option></select></div><div><label>间隔秒数（最低 60）</label><input name=interval_seconds type=number min=60 value=60></div></div><h3>默认提醒条件</h3><div class=check-row><label><input type=checkbox name=keyword_match checked> 关键词命中</label><label><input type=checkbox name=new_item checked> 新条目</label><label><input type=checkbox name=price_change> 价格变化</label><label><input type=checkbox name=stock_change> 库存变化</label></div><div class=form-actions><button class='btn primary' type=submit>批量添加</button> <a class=btn href='/'>取消</a></div></form></div>"""
+        body = f"""<div class=card><h2>批量新增监控</h2><p class=muted>一行一个网站，格式：<code>名称|URL|关键词1,关键词2,关键词3</code>。</p><form method=post action='/monitor/bulk'><label>批量列表</label><textarea name=items style='min-height:260px' placeholder='{html_escape(sample)}'></textarea><div class=grid><div><label>类型</label><select name=mtype><option value=web>Web 网页</option><option value=rss>RSS</option></select></div><div><label>间隔秒数（最低 1，默认 30）</label><input name=interval_seconds type=number min=1 value={DEFAULT_MONITOR_INTERVAL_SECONDS}></div></div><h3>默认提醒条件</h3><div class=check-row><label><input type=checkbox name=keyword_match checked> 关键词命中</label><label><input type=checkbox name=new_item checked> 新条目</label><label><input type=checkbox name=price_change> 价格变化</label><label><input type=checkbox name=stock_change> 库存变化</label></div><div class=form-actions><button class='btn primary' type=submit>批量添加</button> <a class=btn href='/'>取消</a></div></form></div>"""
         return layout("批量新增", body)
 
     @app.post("/monitor/bulk")
-    async def bulk_monitor_save(_: str = Depends(panel_auth), items: str = Form(""), mtype: str = Form("web"), interval_seconds: int = Form(300), keyword_match: str | None = Form(None), new_item: str | None = Form(None), price_change: str | None = Form(None), stock_change: str | None = Form(None), notify_telegram: str | None = Form("on")):
+    async def bulk_monitor_save(_: str = Depends(panel_auth), items: str = Form(""), mtype: str = Form("web"), interval_seconds: int = Form(DEFAULT_MONITOR_INTERVAL_SECONDS), keyword_match: str | None = Form(None), new_item: str | None = Form(None), price_change: str | None = Form(None), stock_change: str | None = Form(None), notify_telegram: str | None = Form("on")):
         cfg = cfg_load_fresh()
         monitors = cfg.setdefault("monitors", [])
         added = 0
@@ -3392,11 +3491,11 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         return RedirectResponse("/", status_code=303)
 
     @app.post("/monitor/create")
-    async def create_monitor(_: str = Depends(panel_auth), name: str = Form(...), mtype: str = Form(...), url: str = Form(...), interval_seconds: int = Form(300), keywords: str = Form(""), item_selector: str = Form(""), title_selector: str = Form(""), link_selector: str = Form(""), price_selector: str = Form(""), stock_selector: str = Form(""), keyword_match: str | None = Form(None), new_item: str | None = Form(None), price_change: str | None = Form(None), stock_change: str | None = Form(None), notify_telegram: str | None = Form(None)) -> RedirectResponse:
+    async def create_monitor(_: str = Depends(panel_auth), name: str = Form(...), mtype: str = Form(...), url: str = Form(...), interval_seconds: int = Form(DEFAULT_MONITOR_INTERVAL_SECONDS), keywords: str = Form(""), item_selector: str = Form(""), title_selector: str = Form(""), link_selector: str = Form(""), price_selector: str = Form(""), stock_selector: str = Form(""), keyword_match: str | None = Form(None), new_item: str | None = Form(None), price_change: str | None = Form(None), stock_change: str | None = Form(None), notify_telegram: str | None = Form(None)) -> RedirectResponse:
         return await save_form_common(None, name, mtype, url, interval_seconds, keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, keyword_match, new_item, price_change, stock_change, notify_telegram)
 
     @app.post("/monitor/save")
-    async def save_monitor(_: str = Depends(panel_auth), original_index: int = Form(...), name: str = Form(...), mtype: str = Form(...), url: str = Form(...), interval_seconds: int = Form(300), keywords: str = Form(""), item_selector: str = Form(""), title_selector: str = Form(""), link_selector: str = Form(""), price_selector: str = Form(""), stock_selector: str = Form(""), keyword_match: str | None = Form(None), new_item: str | None = Form(None), price_change: str | None = Form(None), stock_change: str | None = Form(None), notify_telegram: str | None = Form(None)) -> RedirectResponse:
+    async def save_monitor(_: str = Depends(panel_auth), original_index: int = Form(...), name: str = Form(...), mtype: str = Form(...), url: str = Form(...), interval_seconds: int = Form(DEFAULT_MONITOR_INTERVAL_SECONDS), keywords: str = Form(""), item_selector: str = Form(""), title_selector: str = Form(""), link_selector: str = Form(""), price_selector: str = Form(""), stock_selector: str = Form(""), keyword_match: str | None = Form(None), new_item: str | None = Form(None), price_change: str | None = Form(None), stock_change: str | None = Form(None), notify_telegram: str | None = Form(None)) -> RedirectResponse:
         return await save_form_common(original_index, name, mtype, url, interval_seconds, keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, keyword_match, new_item, price_change, stock_change, notify_telegram)
 
     @app.get("/monitor/{idx}/delete")
@@ -3491,6 +3590,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
 <div class=step><div class=step-title><span class=step-no>3</span><span>高级设置</span></div>
 <p class=muted>一般保持默认即可。</p>
 <div class=grid><div><label>日志级别</label><input name=LOG_LEVEL value='{html_escape(v['LOG_LEVEL'])}'></div><div><label>面板监听地址</label><input name=WEB_PANEL_HOST value='{html_escape(v['WEB_PANEL_HOST'])}'></div><div><label>面板端口</label><input name=WEB_PANEL_PORT value='{html_escape(v['WEB_PANEL_PORT'])}'></div><div><label>面板用户</label><input name=WEB_PANEL_USER value='{html_escape(v['WEB_PANEL_USER'])}'></div><div><label>面板密码</label><input name=WEB_PANEL_PASSWORD value='{html_escape(v['WEB_PANEL_PASSWORD'])}'></div></div>
+<div class=msg>公网提示：监听地址填 <code>0.0.0.0</code> 会让面板监听所有网卡；Docker 是否暴露公网还取决于 <code>docker-compose.yml</code> 的端口映射和服务器防火墙。个人部署建议保持 <code>127.0.0.1</code>，用 SSH 隧道、反代或 Cloudflare Tunnel 访问。</div>
 <h3>自动清理</h3><div class=grid><div><label>清理间隔（分钟）</label><input name=CLEANUP_INTERVAL_MINUTES type=number min=1 value='{html_escape(cleanup.get("interval_minutes", 60))}'></div><div><label>通知删除时间（分钟）</label><input name=CLEANUP_MESSAGE_DELETE_AFTER_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_message_delete_after_minutes", 60))}'></div><div><label>保留监控数据（分钟）</label><input name=CLEANUP_RETENTION_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_retention_minutes", 1440))}'></div></div>
 </div>
 <input type=hidden name=WEB_PANEL_ENABLED value='true'><div class=form-actions><button class='btn primary' type=submit>保存设置</button></div><small>改 Token、管理员 ID、端口或 TG_API_ID / TG_API_HASH 后需要保存并重启。</small></form></div>
@@ -3543,7 +3643,7 @@ async function logoutTgSession() {{
     @app.post("/settings", response_class=HTMLResponse)
     async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), TG_PROXY: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
         save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES)
-        return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
+        return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token、管理员 ID、端口或监听地址后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
 
     @app.get("/send", response_class=HTMLResponse)
@@ -3667,6 +3767,7 @@ async function logoutTgSession() {{
 <div class=grid><div><label>TG_API_ID</label><input name=TG_API_ID value='{html_escape(v['TG_API_ID'])}'></div><div><label>TG_API_HASH</label><input name=TG_API_HASH value='{html_escape(v['TG_API_HASH'])}'></div></div>
 <label>TG_API_SESSION</label><textarea name=TG_API_SESSION>{html_escape(v['TG_API_SESSION'])}</textarea>
 <div class=grid><div><label>日志级别</label><input name=LOG_LEVEL value='{html_escape(v['LOG_LEVEL'])}'></div><div><label>面板监听地址</label><input name=WEB_PANEL_HOST value='{html_escape(v['WEB_PANEL_HOST'])}'></div><div><label>面板端口</label><input name=WEB_PANEL_PORT value='{html_escape(v['WEB_PANEL_PORT'])}'></div><div><label>面板用户</label><input name=WEB_PANEL_USER value='{html_escape(v['WEB_PANEL_USER'])}'></div><div><label>面板密码</label><input name=WEB_PANEL_PASSWORD value='{html_escape(v['WEB_PANEL_PASSWORD'])}'></div></div>
+<div class=msg>公网提示：监听地址填 <code>0.0.0.0</code> 会监听所有网卡；Docker 是否暴露公网还取决于 <code>docker-compose.yml</code> 的端口映射和服务器防火墙。</div>
 <input type=hidden name=WEB_PANEL_ENABLED value='true'><div class=form-actions><button class='btn primary' type=submit>保存配置</button> <a class=btn href='/restart'>重启机器人</a></div></form></div>"""
         body = settings_card + "<div class=card><h2>用户管理</h2><table><tr><th>用户</th><th>状态</th><th>备注</th><th>操作</th></tr>" + "".join(trs) + "</table></div>"
         return layout("用户管理", body)
@@ -3680,7 +3781,7 @@ async function logoutTgSession() {{
             int(cleanup.get("monitor_message_delete_after_minutes", 60)),
             int(cleanup.get("monitor_retention_minutes", 1440)),
         )
-        return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token、管理员 ID、端口、账号或密码后请重启。</div><p><a class=btn href='/users'>返回用户管理</a> <a class=btn href='/restart'>重启机器人</a></p>")
+        return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token、管理员 ID、端口、监听地址、账号或密码后请重启。</div><p><a class=btn href='/users'>返回用户管理</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
     @app.post("/api/tg-login/qr")
     async def api_tg_login_qr(_: str = Depends(panel_auth)) -> dict[str, Any]:
