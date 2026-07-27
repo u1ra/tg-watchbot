@@ -454,6 +454,18 @@ def is_user_verified(user_id: int) -> bool:
     return bool(row and row["status"] == "verified")
 
 
+def reset_user_verification(user_id: int) -> bool:
+    with closing(db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        deleted = conn.execute(
+            "DELETE FROM user_verifications WHERE user_id=?",
+            (user_id,),
+        ).rowcount
+        conn.commit()
+    verification_prompt_times.pop(user_id, None)
+    return deleted == 1
+
+
 def normalize_user_verification(user_id: int, now_ts: float | None = None) -> sqlite3.Row | None:
     current_ts = time.time() if now_ts is None else float(now_ts)
     with closing(db()) as conn:
@@ -4957,14 +4969,49 @@ async function logoutTgSession() {{
     @app.get("/users", response_class=HTMLResponse)
     async def users_page(_: str = Depends(panel_auth)) -> str:
         v = env_values()
+        configured_admin_ids = set(parse_admin_chat_ids(v.get("ADMIN_CHAT_ID", "")))
         with closing(db()) as conn:
-            rows = conn.execute("SELECT user_id, username, full_name, blocked, note, updated_at FROM users ORDER BY updated_at DESC LIMIT 300").fetchall()
+            rows = conn.execute(
+                """
+                SELECT
+                    users.user_id,
+                    users.username,
+                    users.full_name,
+                    users.blocked,
+                    users.note,
+                    users.updated_at,
+                    user_verifications.status AS verification_status,
+                    user_verifications.verification_method
+                FROM users
+                LEFT JOIN user_verifications
+                    ON user_verifications.user_id = users.user_id
+                ORDER BY users.updated_at DESC
+                LIMIT 300
+                """
+            ).fetchall()
         trs = []
         for u in rows:
             status_txt = "封禁" if u["blocked"] else "正常"
             action = "unblock" if u["blocked"] else "block"
             action_txt = "解封" if u["blocked"] else "封禁"
-            trs.append(f"""<tr><td><b>{html_escape(u['full_name'] or u['user_id'])}</b><br><small>{u['user_id']} @{html_escape(u['username'] or '')}</small></td><td><span class=badge>{status_txt}</span><br><small>{html_escape(u['updated_at'])}</small></td><td>{html_escape(u['note'] or '')}</td><td><form method=post action='/users/{u['user_id']}/note'><input name=note value='{html_escape(u['note'] or '')}'><button class=btn type=submit>备注</button></form><div class=actions><a class=btn href='/send?user_id={u['user_id']}'>发消息</a><a class='btn danger' href='/users/{u['user_id']}/{action}'>{action_txt}</a></div></td></tr>""")
+            verification_status = {
+                None: "未验证",
+                "pending_turnstile": "等待 Turnstile",
+                "pending_math": "等待算数题",
+                "cooldown": "验证冷却中",
+                "verified": (
+                    "历史免验证"
+                    if u["verification_method"] == "legacy"
+                    else "已完成两阶段验证"
+                ),
+            }.get(u["verification_status"], "验证状态异常")
+            is_admin_user = int(u["user_id"]) in configured_admin_ids
+            if is_admin_user:
+                verification_status = "管理员免验证"
+                reset_action = "<small class=muted>管理员账号不会进入验证门禁</small>"
+            else:
+                reset_action = f"""<form method=post action='/users/{u['user_id']}/verification/reset' style='display:inline' onsubmit='return confirm("只重置该用户的验证状态，保留用户资料和历史消息。确定继续？")'><button class='btn danger' type=submit>重置验证（测试）</button></form>"""
+            trs.append(f"""<tr><td><b>{html_escape(u['full_name'] or u['user_id'])}</b><br><small>{u['user_id']} @{html_escape(u['username'] or '')}</small></td><td><span class=badge>{status_txt}</span><br><small>验证：{html_escape(verification_status)}</small><br><small>{html_escape(u['updated_at'])}</small></td><td>{html_escape(u['note'] or '')}</td><td><form method=post action='/users/{u['user_id']}/note'><input name=note value='{html_escape(u['note'] or '')}'><button class=btn type=submit>备注</button></form><div class=actions><a class=btn href='/send?user_id={u['user_id']}'>发消息</a><a class='btn danger' href='/users/{u['user_id']}/{action}'>{action_txt}</a>{reset_action}</div></td></tr>""")
         settings_card = f"""<div class=card><h2>Bot / 面板配置</h2><p class=muted>这里和“Bot / 面板设置”共用同一份 .env。修改 Token、管理员 ID、端口、账号或密码后不会自动重启，需要手动重启服务。</p><form method=post action='/users/settings'>
 <label>Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='123456:ABC...'>
 <label>管理员 ADMIN_CHAT_ID（最多 3 个，用逗号分隔）</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}'>
@@ -4976,7 +5023,7 @@ async function logoutTgSession() {{
 <div class=grid><div><label>日志级别</label><input name=LOG_LEVEL value='{html_escape(v['LOG_LEVEL'])}'></div><div><label>面板监听地址</label><input name=WEB_PANEL_HOST value='{html_escape(v['WEB_PANEL_HOST'])}'></div><div><label>面板端口</label><input name=WEB_PANEL_PORT value='{html_escape(v['WEB_PANEL_PORT'])}'></div><div><label>面板用户</label><input name=WEB_PANEL_USER value='{html_escape(v['WEB_PANEL_USER'])}'></div><div><label>面板密码</label><input name=WEB_PANEL_PASSWORD value='{html_escape(v['WEB_PANEL_PASSWORD'])}'></div></div>
 <div class=msg>公网提示：监听地址填 <code>0.0.0.0</code> 会监听所有网卡；Docker 是否暴露公网还取决于 <code>docker-compose.yml</code> 的端口映射和服务器防火墙。</div>
 <input type=hidden name=WEB_PANEL_ENABLED value='true'><div class=form-actions><button class='btn primary' type=submit>保存配置</button> <a class=btn href='/restart'>重启机器人</a></div></form></div>"""
-        body = settings_card + "<div class=card><h2>用户管理</h2><table><tr><th>用户</th><th>状态</th><th>备注</th><th>操作</th></tr>" + "".join(trs) + "</table></div>"
+        body = settings_card + "<div class=card><h2>用户管理</h2><p class=muted>“重置验证（测试）”只清除目标用户的验证状态，保留用户资料和历史消息；该用户下次私聊时会重新进入 Turnstile + 算数题流程。管理员账号始终免验证。</p><table><tr><th>用户</th><th>状态</th><th>备注</th><th>操作</th></tr>" + "".join(trs) + "</table></div>"
         return layout("用户管理", body)
 
     @app.post("/users/settings", response_class=HTMLResponse)
@@ -5068,6 +5115,14 @@ async function logoutTgSession() {{
     @app.post("/users/{user_id}/note")
     async def user_note_save(user_id: int, _: str = Depends(panel_auth), note: str = Form("")) -> RedirectResponse:
         set_note(user_id, note.strip())
+        return RedirectResponse("/users", status_code=303)
+
+    @app.post("/users/{user_id}/verification/reset")
+    async def user_verification_reset(user_id: int, _: str = Depends(panel_auth)) -> RedirectResponse:
+        if not get_user(user_id):
+            raise HTTPException(404, "user not found")
+        reset_user_verification(user_id)
+        logger.info("user verification reset user_id=%s", user_id)
         return RedirectResponse("/users", status_code=303)
 
     @app.get("/users/{user_id}/block")

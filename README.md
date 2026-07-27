@@ -744,6 +744,8 @@ curl http://127.0.0.1:8765/health
 
 管理员可以在 Web 面板的“设置 → 新用户两阶段验证”中修改验证参数；“用户管理”里的共享配置卡片也提供同一组字段。页面会显示当前配置是否完整。可编辑项包括功能开关、Mini App 地址、sitekey、Siteverify Worker 地址、Siteverify 鉴权 Token、预期 hostname/action、各阶段有效期、答错次数、冷却和提示间隔。鉴权 Token 使用密码输入框并只保存在服务端 `.env`；WebUI 不提供生产 Turnstile secret 输入框。Turnstile secret 必须以 `TURNSTILE_SECRET_KEY` 的名称保存在配套 Siteverify Worker 的加密 Secret 中。
 
+“用户管理”列表会显示每个用户当前的验证状态。需要使用现有非管理员账号重新测试完整流程时，可以点击“重置验证（测试）”；该操作只清除目标用户的验证记录和提示间隔缓存，不删除用户资料、备注或历史消息。用户下次私聊 Bot 时会重新进入 Turnstile + 算数题流程。管理员账号始终免验证，因此不会显示重置按钮。
+
 首次验证前发送的消息不会保存或转发；成功后 Bot 会要求用户重新发送。算数题 10 分钟过期，最多答错 3 次，达到上限后冷却 10 分钟并重新从 Turnstile 开始。管理员不受门禁影响，被封禁用户仍优先执行封禁。升级时数据库中已经存在的用户只会在一次性迁移中标记为历史已验证；之后出现的新用户不会因重启而自动放行。
 
 验证状态、题目和过期时间保存在 SQLite，可跨进程重启恢复。原始 nonce 只以哈希形式入库。后端会验证 Telegram `initData` 的 HMAC 与时效，并检查 Turnstile 的 `success`、`hostname` 和 `action`；浏览器显示成功本身不会使用户通过验证。

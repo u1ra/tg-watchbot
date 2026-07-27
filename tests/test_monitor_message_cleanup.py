@@ -430,6 +430,74 @@ class UserVerificationStateTest(unittest.TestCase):
         self.assertFalse(app.is_user_verified(2001))
         self.assertEqual("pending_turnstile", app.get_user_verification(2001)["status"])
 
+    def test_reset_user_verification_preserves_user_and_other_users(self) -> None:
+        app.init_db()
+        app.upsert_user(2001, "Reset User", "reset-user")
+        app.upsert_user(2002, "Other User", "other-user")
+        app.begin_turnstile_verification(2001, now_ts=1000)
+        app.begin_turnstile_verification(2002, now_ts=1000)
+        app.set_note(2001, "keep this note")
+        app.verification_prompt_times[2001] = 1000
+        with closing(sqlite3.connect(app.DB_PATH)) as conn:
+            conn.execute(
+                """
+                INSERT INTO inbox_messages(
+                    user_id, username, full_name, message_type, text, created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (2001, "reset-user", "Reset User", "text", "keep this message", "now"),
+            )
+            conn.commit()
+
+        self.assertTrue(app.reset_user_verification(2001))
+
+        self.assertIsNotNone(app.get_user(2001))
+        self.assertEqual("keep this note", app.get_user(2001)["note"])
+        self.assertIsNone(app.get_user_verification(2001))
+        self.assertIsNotNone(app.get_user_verification(2002))
+        self.assertNotIn(2001, app.verification_prompt_times)
+        self.assertFalse(app.reset_user_verification(2001))
+        with closing(sqlite3.connect(app.DB_PATH)) as conn:
+            message = conn.execute(
+                "SELECT text FROM inbox_messages WHERE user_id=?",
+                (2001,),
+            ).fetchone()
+        self.assertEqual(("keep this message",), message)
+
+    def test_user_panel_exposes_post_only_verification_reset(self) -> None:
+        old_admin_chat_id = os.environ.get("ADMIN_CHAT_ID")
+        os.environ["ADMIN_CHAT_ID"] = "9999"
+        try:
+            app.init_db()
+            app.upsert_user(2001, "Reset User", "reset-user")
+            app.begin_turnstile_verification(2001, now_ts=1000)
+            panel = app.create_panel_app()
+            page = asyncio.run(panel.routes[("GET", "/users")]())
+            reset_route = panel.routes[("POST", "/users/{user_id}/verification/reset")]
+
+            self.assertIn(
+                "method=post action='/users/2001/verification/reset'",
+                page,
+            )
+            self.assertIn("重置验证（测试）", page)
+            self.assertIn("验证：等待 Turnstile", page)
+            self.assertNotIn(
+                ("GET", "/users/{user_id}/verification/reset"),
+                panel.routes,
+            )
+
+            response = asyncio.run(reset_route(2001))
+            self.assertEqual(303, response.status_code)
+            self.assertEqual("/users", response.url)
+            self.assertIsNone(app.get_user_verification(2001))
+            self.assertIsNotNone(app.get_user(2001))
+        finally:
+            if old_admin_chat_id is None:
+                os.environ.pop("ADMIN_CHAT_ID", None)
+            else:
+                os.environ["ADMIN_CHAT_ID"] = old_admin_chat_id
+
 
 class PrivateVerificationGateTest(unittest.TestCase):
     ENV_KEYS = [
