@@ -12,8 +12,10 @@ import argparse
 import asyncio
 import base64
 import hashlib
+import hmac
 import html
 import io
+import json
 import logging
 import os
 import re
@@ -28,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import parse_qsl, quote_plus, urljoin, urlparse
 import os.path as ospath
 
 import feedparser
@@ -43,10 +45,10 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 from aiogram.client.default import DefaultBotProperties
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, status
-from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
 import uvicorn
 
 try:
@@ -67,6 +69,36 @@ DEFAULT_MONITOR_INTERVAL_SECONDS = 30
 DEFAULT_MONITOR_MESSAGE_DELETE_AFTER_MINUTES = 60
 DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS = 30
 DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS = 300
+DEFAULT_VERIFICATION_SESSION_TTL_SECONDS = 600
+DEFAULT_VERIFICATION_MATH_TTL_SECONDS = 600
+DEFAULT_VERIFICATION_MATH_MAX_ATTEMPTS = 3
+DEFAULT_VERIFICATION_COOLDOWN_SECONDS = 600
+DEFAULT_VERIFICATION_PROMPT_INTERVAL_SECONDS = 15
+VERIFICATION_LEGACY_MIGRATION_KEY = "user_verification_legacy_migration_v1"
+TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+TURNSTILE_TEST_SECRET = "1x0000000000000000000000000000000AA"
+VERIFICATION_ENV_DEFAULTS = {
+    "BOT_VERIFICATION_ENABLED": "false",
+    "BOT_VERIFICATION_PUBLIC_BASE_URL": "",
+    "BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS": "300",
+    "BOT_VERIFICATION_SESSION_TTL_SECONDS": "600",
+    "BOT_VERIFICATION_MATH_TTL_SECONDS": "600",
+    "BOT_VERIFICATION_MATH_MAX_ATTEMPTS": "3",
+    "BOT_VERIFICATION_COOLDOWN_SECONDS": "600",
+    "BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS": "15",
+    "TURNSTILE_SITE_KEY": "",
+    "TURNSTILE_VERIFY_ENDPOINT": "",
+    "TURNSTILE_EXPECTED_HOSTNAME": "",
+    "TURNSTILE_EXPECTED_ACTION": "turnstile-spin-v1",
+    "TURNSTILE_TEST_MODE": "false",
+}
+PUBLIC_PANEL_PATHS = {
+    "/login",
+    "/health",
+    "/favicon.ico",
+    "/verify/telegram",
+    "/api/verify/turnstile",
+}
 
 DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -80,6 +112,8 @@ admin_chat_id: int | None = None
 admin_chat_ids: list[int] = []
 config: dict[str, Any] = {}
 rate_buckets: dict[int, list[float]] = {}
+verification_prompt_times: dict[int, float] = {}
+verification_api_buckets: dict[str, list[float]] = {}
 pending_sendpic: dict[int, dict[str, Any]] = {}
 scheduler_ref: AsyncIOScheduler | None = None
 user_session_listener_task: asyncio.Task | None = None
@@ -127,6 +161,7 @@ def monitor_cleanup_settings() -> dict[str, int | bool]:
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -230,6 +265,23 @@ def init_db() -> None:
                 meta_value TEXT,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS user_verifications (
+                user_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL,
+                turnstile_nonce_hash TEXT,
+                turnstile_expires_at REAL,
+                math_question TEXT,
+                math_answer INTEGER,
+                math_attempts INTEGER NOT NULL DEFAULT 0,
+                math_expires_at REAL,
+                cooldown_until REAL,
+                verified_at TEXT,
+                verification_method TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_verifications_status
+                ON user_verifications(status);
             CREATE TABLE IF NOT EXISTS telegram_login_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_name TEXT NOT NULL DEFAULT 'default',
@@ -309,6 +361,27 @@ def init_db() -> None:
             except sqlite3.OperationalError:
                 pass
         conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        migration = conn.execute(
+            "SELECT meta_value FROM app_meta WHERE meta_key=?",
+            (VERIFICATION_LEGACY_MIGRATION_KEY,),
+        ).fetchone()
+        if not migration:
+            ts = now_iso()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO user_verifications(
+                    user_id, status, verified_at, verification_method, created_at, updated_at
+                )
+                SELECT user_id, 'verified', ?, 'legacy', ?, ? FROM users
+                """,
+                (ts, ts, ts),
+            )
+            conn.execute(
+                "INSERT INTO app_meta(meta_key, meta_value, updated_at) VALUES(?,?,?)",
+                (VERIFICATION_LEGACY_MIGRATION_KEY, "completed", ts),
+            )
+        conn.commit()
 
 
 def now_iso() -> str:
@@ -352,6 +425,305 @@ def upsert_user(user_id: int, full_name: str, username: str | None) -> None:
 def get_user(user_id: int) -> sqlite3.Row | None:
     with closing(db()) as conn:
         return conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+
+
+def get_user_verification(user_id: int) -> sqlite3.Row | None:
+    with closing(db()) as conn:
+        return conn.execute(
+            "SELECT * FROM user_verifications WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+
+
+def verification_nonce_hash(nonce: str) -> str:
+    return hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+
+
+def generate_math_challenge() -> tuple[str, int]:
+    left = secrets.randbelow(20) + 1
+    right = secrets.randbelow(20) + 1
+    if secrets.randbelow(2) == 0:
+        return f"{left} + {right} = ?", left + right
+    high, low = max(left, right), min(left, right)
+    return f"{high} - {low} = ?", high - low
+
+
+def is_user_verified(user_id: int) -> bool:
+    row = get_user_verification(user_id)
+    return bool(row and row["status"] == "verified")
+
+
+def normalize_user_verification(user_id: int, now_ts: float | None = None) -> sqlite3.Row | None:
+    current_ts = time.time() if now_ts is None else float(now_ts)
+    with closing(db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM user_verifications WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            conn.commit()
+            return None
+        expired = False
+        if row["status"] == "pending_math":
+            expired = not row["math_expires_at"] or float(row["math_expires_at"]) <= current_ts
+        elif row["status"] == "cooldown":
+            expired = not row["cooldown_until"] or float(row["cooldown_until"]) <= current_ts
+        if expired:
+            conn.execute(
+                """
+                UPDATE user_verifications
+                SET status='pending_turnstile',
+                    turnstile_nonce_hash=NULL,
+                    turnstile_expires_at=NULL,
+                    math_question=NULL,
+                    math_answer=NULL,
+                    math_attempts=0,
+                    math_expires_at=NULL,
+                    cooldown_until=NULL,
+                    updated_at=?
+                WHERE user_id=?
+                """,
+                (now_iso(), user_id),
+            )
+        elif (
+            row["status"] == "pending_turnstile"
+            and row["turnstile_expires_at"]
+            and float(row["turnstile_expires_at"]) <= current_ts
+        ):
+            conn.execute(
+                """
+                UPDATE user_verifications
+                SET turnstile_nonce_hash=NULL, turnstile_expires_at=NULL, updated_at=?
+                WHERE user_id=?
+                """,
+                (now_iso(), user_id),
+            )
+        conn.commit()
+        return conn.execute(
+            "SELECT * FROM user_verifications WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+
+
+def begin_turnstile_verification(
+    user_id: int,
+    now_ts: float | None = None,
+    ttl_seconds: int = DEFAULT_VERIFICATION_SESSION_TTL_SECONDS,
+) -> dict[str, Any]:
+    current_ts = time.time() if now_ts is None else float(now_ts)
+    row = normalize_user_verification(user_id, current_ts)
+    if row and row["status"] == "verified":
+        return {"status": "verified", "nonce": "", "expires_at": None}
+    if row and row["status"] == "cooldown" and row["cooldown_until"]:
+        return {
+            "status": "cooldown",
+            "nonce": "",
+            "expires_at": float(row["cooldown_until"]),
+        }
+    nonce = secrets.token_urlsafe(32)
+    expires_at = current_ts + max(1, int(ttl_seconds))
+    ts = now_iso()
+    with closing(db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT status FROM user_verifications WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if current and current["status"] == "verified":
+            conn.commit()
+            return {"status": "verified", "nonce": "", "expires_at": None}
+        conn.execute(
+            """
+            INSERT INTO user_verifications(
+                user_id, status, turnstile_nonce_hash, turnstile_expires_at,
+                math_question, math_answer, math_attempts, math_expires_at,
+                cooldown_until, verified_at, verification_method, created_at, updated_at
+            )
+            VALUES(?, 'pending_turnstile', ?, ?, NULL, NULL, 0, NULL, NULL, NULL, NULL, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                status='pending_turnstile',
+                turnstile_nonce_hash=excluded.turnstile_nonce_hash,
+                turnstile_expires_at=excluded.turnstile_expires_at,
+                math_question=NULL,
+                math_answer=NULL,
+                math_attempts=0,
+                math_expires_at=NULL,
+                cooldown_until=NULL,
+                verified_at=NULL,
+                verification_method=NULL,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, verification_nonce_hash(nonce), expires_at, ts, ts),
+        )
+        conn.commit()
+    return {"status": "pending_turnstile", "nonce": nonce, "expires_at": expires_at}
+
+
+def turnstile_session_is_valid(user_id: int, nonce: str, now_ts: float | None = None) -> bool:
+    if not nonce:
+        return False
+    current_ts = time.time() if now_ts is None else float(now_ts)
+    row = normalize_user_verification(user_id, current_ts)
+    if not row or row["status"] != "pending_turnstile":
+        return False
+    if not row["turnstile_nonce_hash"] or not row["turnstile_expires_at"]:
+        return False
+    if float(row["turnstile_expires_at"]) <= current_ts:
+        return False
+    return secrets.compare_digest(
+        str(row["turnstile_nonce_hash"]),
+        verification_nonce_hash(nonce),
+    )
+
+
+def advance_turnstile_to_math(
+    user_id: int,
+    nonce: str,
+    now_ts: float | None = None,
+    ttl_seconds: int = DEFAULT_VERIFICATION_MATH_TTL_SECONDS,
+) -> dict[str, Any] | None:
+    current_ts = time.time() if now_ts is None else float(now_ts)
+    nonce_digest = verification_nonce_hash(nonce) if nonce else ""
+    question, answer = generate_math_challenge()
+    expires_at = current_ts + max(1, int(ttl_seconds))
+    with closing(db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM user_verifications WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        valid = bool(
+            row
+            and row["status"] == "pending_turnstile"
+            and row["turnstile_nonce_hash"]
+            and row["turnstile_expires_at"]
+            and float(row["turnstile_expires_at"]) > current_ts
+            and secrets.compare_digest(str(row["turnstile_nonce_hash"]), nonce_digest)
+        )
+        if not valid:
+            conn.commit()
+            return None
+        changed = conn.execute(
+            """
+            UPDATE user_verifications
+            SET status='pending_math',
+                turnstile_nonce_hash=NULL,
+                turnstile_expires_at=NULL,
+                math_question=?,
+                math_answer=?,
+                math_attempts=0,
+                math_expires_at=?,
+                cooldown_until=NULL,
+                updated_at=?
+            WHERE user_id=? AND status='pending_turnstile' AND turnstile_nonce_hash=?
+            """,
+            (question, answer, expires_at, now_iso(), user_id, nonce_digest),
+        ).rowcount
+        conn.commit()
+        if changed != 1:
+            return None
+    return {
+        "status": "pending_math",
+        "question": question,
+        "expires_at": expires_at,
+        "attempts_remaining": DEFAULT_VERIFICATION_MATH_MAX_ATTEMPTS,
+    }
+
+
+def submit_math_verification(
+    user_id: int,
+    answer_text: str,
+    now_ts: float | None = None,
+    max_attempts: int = DEFAULT_VERIFICATION_MATH_MAX_ATTEMPTS,
+    cooldown_seconds: int = DEFAULT_VERIFICATION_COOLDOWN_SECONDS,
+) -> dict[str, Any]:
+    current_ts = time.time() if now_ts is None else float(now_ts)
+    max_tries = max(1, int(max_attempts))
+    parsed_answer = int(answer_text.strip()) if re.fullmatch(r"[+-]?\d+", answer_text.strip()) else None
+    with closing(db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM user_verifications WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if not row or row["status"] != "pending_math":
+            conn.commit()
+            return {"result": "not_pending"}
+        if not row["math_expires_at"] or float(row["math_expires_at"]) <= current_ts:
+            conn.execute(
+                """
+                UPDATE user_verifications
+                SET status='pending_turnstile',
+                    math_question=NULL,
+                    math_answer=NULL,
+                    math_attempts=0,
+                    math_expires_at=NULL,
+                    updated_at=?
+                WHERE user_id=? AND status='pending_math'
+                """,
+                (now_iso(), user_id),
+            )
+            conn.commit()
+            return {"result": "expired"}
+        if parsed_answer is None:
+            conn.commit()
+            return {
+                "result": "invalid",
+                "question": str(row["math_question"] or ""),
+                "attempts_remaining": max_tries - int(row["math_attempts"] or 0),
+            }
+        if parsed_answer == int(row["math_answer"]):
+            ts = now_iso()
+            changed = conn.execute(
+                """
+                UPDATE user_verifications
+                SET status='verified',
+                    turnstile_nonce_hash=NULL,
+                    turnstile_expires_at=NULL,
+                    math_question=NULL,
+                    math_answer=NULL,
+                    math_attempts=0,
+                    math_expires_at=NULL,
+                    cooldown_until=NULL,
+                    verified_at=?,
+                    verification_method='turnstile_math',
+                    updated_at=?
+                WHERE user_id=? AND status='pending_math'
+                """,
+                (ts, ts, user_id),
+            ).rowcount
+            conn.commit()
+            return {"result": "verified" if changed == 1 else "not_pending"}
+        attempts = int(row["math_attempts"] or 0) + 1
+        if attempts >= max_tries:
+            cooldown_until = current_ts + max(1, int(cooldown_seconds))
+            conn.execute(
+                """
+                UPDATE user_verifications
+                SET status='cooldown',
+                    math_question=NULL,
+                    math_answer=NULL,
+                    math_attempts=?,
+                    math_expires_at=NULL,
+                    cooldown_until=?,
+                    updated_at=?
+                WHERE user_id=? AND status='pending_math'
+                """,
+                (attempts, cooldown_until, now_iso(), user_id),
+            )
+            conn.commit()
+            return {"result": "cooldown", "cooldown_until": cooldown_until}
+        conn.execute(
+            "UPDATE user_verifications SET math_attempts=?, updated_at=? WHERE user_id=? AND status='pending_math'",
+            (attempts, now_iso(), user_id),
+        )
+        conn.commit()
+        return {
+            "result": "incorrect",
+            "question": str(row["math_question"] or ""),
+            "attempts_remaining": max_tries - attempts,
+        }
 
 
 def is_blocked(user_id: int) -> bool:
@@ -398,6 +770,252 @@ def rate_limited(user_id: int) -> bool:
     bucket.append(t)
     rate_buckets[user_id] = bucket
     return len(bucket) > max_messages
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    fallback = "true" if default else "false"
+    return os.getenv(name, fallback).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default)).strip()))
+    except (TypeError, ValueError):
+        return max(minimum, int(default))
+
+
+def verification_settings() -> dict[str, Any]:
+    return {
+        "enabled": env_flag("BOT_VERIFICATION_ENABLED", False),
+        "web_panel_enabled": env_flag("WEB_PANEL_ENABLED", True),
+        "public_base_url": os.getenv("BOT_VERIFICATION_PUBLIC_BASE_URL", "").strip().rstrip("/"),
+        "initdata_max_age_seconds": env_int("BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS", 300),
+        "session_ttl_seconds": env_int(
+            "BOT_VERIFICATION_SESSION_TTL_SECONDS",
+            DEFAULT_VERIFICATION_SESSION_TTL_SECONDS,
+        ),
+        "math_ttl_seconds": env_int(
+            "BOT_VERIFICATION_MATH_TTL_SECONDS",
+            DEFAULT_VERIFICATION_MATH_TTL_SECONDS,
+        ),
+        "math_max_attempts": env_int(
+            "BOT_VERIFICATION_MATH_MAX_ATTEMPTS",
+            DEFAULT_VERIFICATION_MATH_MAX_ATTEMPTS,
+        ),
+        "cooldown_seconds": env_int(
+            "BOT_VERIFICATION_COOLDOWN_SECONDS",
+            DEFAULT_VERIFICATION_COOLDOWN_SECONDS,
+        ),
+        "prompt_interval_seconds": env_int(
+            "BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS",
+            DEFAULT_VERIFICATION_PROMPT_INTERVAL_SECONDS,
+        ),
+        "turnstile_site_key": os.getenv("TURNSTILE_SITE_KEY", "").strip(),
+        "turnstile_verify_endpoint": os.getenv("TURNSTILE_VERIFY_ENDPOINT", "").strip(),
+        "turnstile_expected_hostname": os.getenv("TURNSTILE_EXPECTED_HOSTNAME", "").strip(),
+        "turnstile_expected_action": os.getenv(
+            "TURNSTILE_EXPECTED_ACTION",
+            "turnstile-spin-v1",
+        ).strip(),
+        "turnstile_test_mode": env_flag("TURNSTILE_TEST_MODE", False),
+    }
+
+
+def validate_telegram_init_data(
+    init_data: str,
+    bot_token: str,
+    max_age_seconds: int = 300,
+    now_ts: float | None = None,
+) -> dict[str, Any] | None:
+    if not init_data or not bot_token or len(init_data) > 8192:
+        return None
+    try:
+        pairs = parse_qsl(init_data, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return None
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        return None
+    values = dict(pairs)
+    received_hash = values.pop("hash", "")
+    if not received_hash or not re.fullmatch(r"[0-9a-fA-F]{64}", received_hash):
+        return None
+    data_check_string = "\n".join(f"{key}={values[key]}" for key in sorted(values))
+    secret_key = hmac.new(
+        key=b"WebAppData",
+        msg=bot_token.encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).digest()
+    calculated_hash = hmac.new(
+        key=secret_key,
+        msg=data_check_string.encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(calculated_hash, received_hash.lower()):
+        return None
+    try:
+        auth_date = int(values["auth_date"])
+        user = json.loads(values["user"])
+        user_id = int(user["id"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(user, dict) or user_id <= 0 or bool(user.get("is_bot", False)):
+        return None
+    current_ts = time.time() if now_ts is None else float(now_ts)
+    if auth_date > current_ts + 30:
+        return None
+    if current_ts - auth_date > max(1, int(max_age_seconds)):
+        return None
+    return {
+        "user_id": user_id,
+        "user": user,
+        "auth_date": auth_date,
+        "query_id": values.get("query_id", ""),
+    }
+
+
+def turnstile_configuration_error(settings: dict[str, Any] | None = None) -> str:
+    values = settings or verification_settings()
+    if not values.get("enabled"):
+        return "verification-disabled"
+    if not values.get("web_panel_enabled", True):
+        return "web-panel-disabled"
+    if not values.get("turnstile_site_key"):
+        return "missing-site-key"
+    base_url = str(values.get("public_base_url") or "")
+    parsed_base = urlparse(base_url)
+    if parsed_base.scheme not in {"http", "https"} or not parsed_base.hostname:
+        return "invalid-public-base-url"
+    if values.get("turnstile_test_mode"):
+        if parsed_base.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            return "test-mode-requires-loopback-host"
+        return ""
+    endpoint = str(values.get("turnstile_verify_endpoint") or "")
+    if not endpoint.startswith("https://"):
+        return "missing-secure-verify-endpoint"
+    if not values.get("turnstile_expected_hostname"):
+        return "missing-expected-hostname"
+    if not values.get("turnstile_expected_action"):
+        return "missing-expected-action"
+    return ""
+
+
+async def verify_turnstile_token(
+    token: str,
+    remote_ip: str = "",
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    values = settings or verification_settings()
+    if not token or len(token) > 2048:
+        return {"success": False, "error-codes": ["invalid-input-response"]}
+    config_error = turnstile_configuration_error(values)
+    if config_error:
+        return {"success": False, "error-codes": [config_error]}
+    if values.get("turnstile_test_mode"):
+        endpoint = TURNSTILE_SITEVERIFY_URL
+        payload = {
+            "secret": TURNSTILE_TEST_SECRET,
+            "response": token,
+        }
+    else:
+        endpoint = str(values["turnstile_verify_endpoint"])
+        payload = {
+            "token": token,
+            "cf-turnstile-response": token,
+        }
+    if remote_ip:
+        payload["remoteip"] = remote_ip
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            response = await client.post(endpoint, data=payload)
+            response.raise_for_status()
+            result = response.json()
+    except Exception as exc:
+        logger.warning("turnstile verification request failed: %s", type(exc).__name__)
+        return {"success": False, "error-codes": ["verification-request-failed"]}
+    if not isinstance(result, dict):
+        return {"success": False, "error-codes": ["invalid-verification-response"]}
+    return result
+
+
+def verification_api_rate_limited(
+    key: str,
+    now_ts: float | None = None,
+    window_seconds: int = 60,
+    max_requests: int = 10,
+) -> bool:
+    current_ts = time.time() if now_ts is None else float(now_ts)
+    window = max(1, int(window_seconds))
+    limit = max(1, int(max_requests))
+    bucket = [
+        seen_at
+        for seen_at in verification_api_buckets.get(key, [])
+        if current_ts - seen_at <= window
+    ]
+    bucket.append(current_ts)
+    verification_api_buckets[key] = bucket
+    return len(bucket) > limit
+
+
+async def complete_turnstile_verification(
+    init_data: str,
+    nonce: str,
+    turnstile_token: str,
+    remote_ip: str = "",
+    now_ts: float | None = None,
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    values = settings or verification_settings()
+    config_error = turnstile_configuration_error(values)
+    if config_error:
+        return {"ok": False, "error": "verification-unavailable"}
+    identity = validate_telegram_init_data(
+        init_data,
+        os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+        max_age_seconds=int(values["initdata_max_age_seconds"]),
+        now_ts=now_ts,
+    )
+    if not identity:
+        return {"ok": False, "error": "invalid-telegram-session"}
+    user_id = int(identity["user_id"])
+    user = get_user(user_id)
+    if not user or is_blocked(user_id):
+        return {"ok": False, "error": "invalid-user"}
+    if not turnstile_session_is_valid(user_id, nonce, now_ts=now_ts):
+        return {"ok": False, "error": "invalid-or-expired-challenge"}
+    validation = await verify_turnstile_token(turnstile_token, remote_ip, values)
+    if not validation.get("success"):
+        return {"ok": False, "error": "turnstile-failed"}
+    expected_hostname = str(values.get("turnstile_expected_hostname") or "")
+    actual_hostname = str(validation.get("hostname") or "")
+    if expected_hostname and actual_hostname.lower().rstrip(".") != expected_hostname.lower().rstrip("."):
+        return {"ok": False, "error": "turnstile-hostname-mismatch"}
+    expected_action = str(values.get("turnstile_expected_action") or "")
+    if expected_action and validation.get("action") != expected_action:
+        return {"ok": False, "error": "turnstile-action-mismatch"}
+    math = advance_turnstile_to_math(
+        user_id,
+        nonce,
+        now_ts=now_ts,
+        ttl_seconds=int(values["math_ttl_seconds"]),
+    )
+    if not math:
+        return {"ok": False, "error": "challenge-already-used"}
+    question_sent = False
+    if bot:
+        try:
+            math_ttl_minutes = max(1, (int(values["math_ttl_seconds"]) + 59) // 60)
+            await bot.send_message(
+                user_id,
+                "第一阶段验证已通过。\n"
+                f"第二阶段算数题：{math['question']}\n"
+                f"请在 {math_ttl_minutes} 分钟内直接回复数字答案，"
+                f"最多可答错 {values['math_max_attempts']} 次。",
+            )
+            question_sent = True
+        except Exception:
+            logger.exception("failed to send math challenge user_id=%s", user_id)
+    return {"ok": True, "question_sent": question_sent}
 
 
 def save_message_map(admin_chat_id: int, admin_message_id: int, user_id: int, user_message_id: int | None) -> None:
@@ -1801,6 +2419,160 @@ def is_admin_action_message(message: Message) -> bool:
     return bool(message.reply_to_message and message.text)
 
 
+def verification_web_app_url(nonce: str, settings: dict[str, Any] | None = None) -> str:
+    values = settings or verification_settings()
+    base_url = str(values.get("public_base_url") or "").rstrip("/")
+    if not base_url.startswith("https://"):
+        raise ValueError("BOT_VERIFICATION_PUBLIC_BASE_URL 必须是 HTTPS 地址")
+    return f"{base_url}/verify/telegram?nonce={quote_plus(nonce)}"
+
+
+def verification_keyboard(nonce: str, settings: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="开始人机验证",
+                    web_app=WebAppInfo(url=verification_web_app_url(nonce, settings)),
+                )
+            ]
+        ]
+    )
+
+
+async def send_turnstile_verification_prompt(
+    message: Message,
+    user_id: int,
+    now_ts: float | None = None,
+) -> None:
+    current_ts = time.time() if now_ts is None else float(now_ts)
+    settings = verification_settings()
+    last_prompt = verification_prompt_times.get(user_id, 0.0)
+    if current_ts - last_prompt < int(settings["prompt_interval_seconds"]):
+        return
+    verification_prompt_times[user_id] = current_ts
+    config_error = turnstile_configuration_error(settings)
+    if config_error:
+        logger.error("verification prompt unavailable: %s", config_error)
+        await message.answer("人机验证暂不可用，请稍后再试。")
+        return
+    active = normalize_user_verification(user_id, current_ts)
+    if (
+        active
+        and active["status"] == "pending_turnstile"
+        and active["turnstile_nonce_hash"]
+        and active["turnstile_expires_at"]
+        and float(active["turnstile_expires_at"]) > current_ts
+    ):
+        remaining = max(1, int(float(active["turnstile_expires_at"]) - current_ts))
+        await message.answer(
+            f"上一条人机验证入口仍有效（约 {remaining} 秒），请使用上一条消息中的按钮。"
+        )
+        return
+    try:
+        challenge = begin_turnstile_verification(
+            user_id,
+            now_ts=current_ts,
+            ttl_seconds=int(settings["session_ttl_seconds"]),
+        )
+        if challenge["status"] == "verified":
+            return
+        if challenge["status"] == "cooldown":
+            remaining = max(1, int(float(challenge["expires_at"]) - current_ts))
+            await message.answer(f"验证失败次数过多，请在约 {remaining} 秒后重试。")
+            return
+        markup = verification_keyboard(str(challenge["nonce"]), settings)
+    except ValueError:
+        logger.error("verification public URL is missing or not HTTPS")
+        await message.answer("人机验证暂不可用，请稍后再试。")
+        return
+    await message.answer(
+        "首次联系需要完成两阶段人机验证。\n"
+        "第一步：点击下方按钮完成 Cloudflare Turnstile；完成后我会发送一道算数题。\n"
+        "验证前发送的消息不会保存，请在验证成功后重新发送。",
+        reply_markup=markup,
+    )
+
+
+def should_gate_private_message(message: Message) -> bool:
+    if not verification_settings()["enabled"]:
+        return False
+    if message.chat.type != "private" or is_admin_chat(message):
+        return False
+    uid = int(getattr(message.from_user, "id", 0) or 0)
+    if not uid:
+        return False
+    return is_blocked(uid) or not is_user_verified(uid)
+
+
+async def handle_private_verification_gate(
+    message: Message,
+    now_ts: float | None = None,
+) -> bool:
+    """Return True only when the message may continue to the normal user handlers."""
+    if not verification_settings()["enabled"]:
+        return True
+    if message.chat.type != "private" or is_admin_chat(message):
+        return True
+    uid, full, username = user_display(message)
+    if not uid:
+        return False
+    upsert_user(uid, full, username)
+    if is_blocked(uid):
+        await message.answer("你当前无法发送消息。")
+        return False
+    current_ts = time.time() if now_ts is None else float(now_ts)
+    row = normalize_user_verification(uid, current_ts)
+    if row and row["status"] == "verified":
+        return True
+    if row and row["status"] == "pending_math":
+        settings = verification_settings()
+        result = submit_math_verification(
+            uid,
+            message.text or "",
+            now_ts=current_ts,
+            max_attempts=int(settings["math_max_attempts"]),
+            cooldown_seconds=int(settings["cooldown_seconds"]),
+        )
+        outcome = result["result"]
+        if outcome == "verified":
+            await message.answer("验证成功。请重新发送你刚才想发送的消息。")
+        elif outcome == "invalid":
+            await message.answer(
+                f"请输入算数题的数字答案，不会扣除次数。\n题目：{result['question']}"
+            )
+        elif outcome == "incorrect":
+            await message.answer(
+                f"答案不正确，还可尝试 {result['attempts_remaining']} 次。\n"
+                f"题目：{result['question']}"
+            )
+        elif outcome == "cooldown":
+            remaining = max(1, int(float(result["cooldown_until"]) - current_ts))
+            await message.answer(
+                f"连续答错次数过多，已进入冷却。请在约 {remaining} 秒后重新验证。"
+            )
+        elif outcome == "expired":
+            await message.answer("算数题已过期，请重新完成人机验证。")
+            verification_prompt_times.pop(uid, None)
+            await send_turnstile_verification_prompt(message, uid, current_ts)
+        return False
+    if row and row["status"] == "cooldown":
+        remaining = max(1, int(float(row["cooldown_until"] or current_ts) - current_ts))
+        last_prompt = verification_prompt_times.get(uid, 0.0)
+        interval = int(verification_settings()["prompt_interval_seconds"])
+        if current_ts - last_prompt >= interval:
+            verification_prompt_times[uid] = current_ts
+            await message.answer(f"验证失败次数过多，请在约 {remaining} 秒后重试。")
+        return False
+    await send_turnstile_verification_prompt(message, uid, current_ts)
+    return False
+
+
+@router.message(should_gate_private_message)
+async def private_verification_gate(message: Message) -> None:
+    await handle_private_verification_gate(message)
+
+
 @router.message(Command("start"))
 async def start(message: Message) -> None:
     uid, full, username = user_display(message)
@@ -2597,6 +3369,155 @@ def theme_interaction_script() -> str:
 </script>"""
 
 
+def panel_path_is_public(path: str) -> bool:
+    return path in PUBLIC_PANEL_PATHS
+
+
+def verification_page_html(
+    nonce: str,
+    settings: dict[str, Any] | None = None,
+    csp_nonce: str = "",
+) -> str:
+    values = settings or verification_settings()
+    site_key = str(values.get("turnstile_site_key") or "")
+    expected_action = str(values.get("turnstile_expected_action") or "turnstile-spin-v1")
+    site_key_json = json.dumps(site_key)
+    action_json = json.dumps(expected_action)
+    challenge_json = json.dumps(nonce)
+    # JSON strings are embedded in a script element, so neutralize HTML tag delimiters.
+    site_key_json = site_key_json.replace("<", "\\u003c").replace(">", "\\u003e")
+    action_json = action_json.replace("<", "\\u003c").replace(">", "\\u003e")
+    challenge_json = challenge_json.replace("<", "\\u003c").replace(">", "\\u003e")
+    safe_csp_nonce = html_escape(csp_nonce)
+    safe_site_key = html.escape(site_key, quote=True)
+    safe_action = html.escape(expected_action, quote=True)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>身份验证 · tg-watchbot</title>
+<script nonce="{safe_csp_nonce}" src="https://telegram.org/js/telegram-web-app.js"></script>
+<script nonce="{safe_csp_nonce}" src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" defer></script>
+<style nonce="{safe_csp_nonce}">
+:root{{color-scheme:light dark;--bg:#f2f2f2;--card:#fff;--ink:#121212;--muted:#555;--blue:#1040c0;--yellow:#f0c020}}
+*{{box-sizing:border-box}}
+body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;background:var(--bg);color:var(--ink);font-family:Arial,"PingFang SC",sans-serif}}
+main{{width:min(440px,100%);padding:24px;border:3px solid var(--ink);background:var(--card);box-shadow:7px 7px 0 var(--ink)}}
+h1{{margin:0 0 10px;font-size:25px}}p{{line-height:1.55}}.step{{font-weight:800;color:var(--blue)}}#widget{{min-height:70px;margin:22px 0}}
+#status{{margin:16px 0 0;padding:12px;border:2px solid var(--ink);background:#fff;color:#121212}}.pending{{background:var(--yellow)!important}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#08080a;--card:#17171b;--ink:#f4f4f5;--muted:#aaa}}main{{box-shadow:7px 7px 0 #5e6ad2}}}}
+</style>
+</head>
+<body>
+<main>
+<div class="step">第 1 / 2 步</div>
+<h1>请完成人机验证</h1>
+<p>通过后，机器人会在 Telegram 私聊中发送一道算数题。验证页面不会保存你原先发送的消息。</p>
+<div id="widget" aria-label="Cloudflare Turnstile" data-sitekey="{safe_site_key}" data-action="{safe_action}"></div>
+<div id="status" class="pending" role="status" aria-live="polite">正在加载验证组件…</div>
+</main>
+<script nonce="{safe_csp_nonce}">
+(function () {{
+  "use strict";
+  var tg = window.Telegram && window.Telegram.WebApp;
+  var statusBox = document.getElementById("status");
+  var submitting = false;
+  var widgetId = null;
+  var challengeNonce = {challenge_json};
+  var siteKey = {site_key_json};
+  var expectedAction = {action_json};
+
+  function show(message, pending) {{
+    statusBox.textContent = message;
+    statusBox.classList.toggle("pending", Boolean(pending));
+  }}
+
+  async function submitToken(token) {{
+    if (submitting) return;
+    if (!tg || !tg.initData) {{
+      show("请从 Telegram 机器人发送的验证按钮打开此页面。", false);
+      return;
+    }}
+    submitting = true;
+    show("正在核验，请稍候…", true);
+    var body = new URLSearchParams();
+    body.set("init_data", tg.initData);
+    body.set("nonce", challengeNonce);
+    body.set("cf-turnstile-response", token);
+    try {{
+      var response = await fetch("/api/verify/turnstile", {{
+        method: "POST",
+        credentials: "same-origin",
+        headers: {{"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"}},
+        body: body.toString()
+      }});
+      var result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || "verification-failed");
+      show(result.question_sent
+        ? "第一阶段已通过。请返回 Telegram 完成算数题。"
+        : "第一阶段已通过。请返回 Telegram；若未看到算数题，请重新发送一条消息。", false);
+      if (tg) {{
+        tg.HapticFeedback && tg.HapticFeedback.notificationOccurred("success");
+        setTimeout(function () {{ tg.close(); }}, 1800);
+      }}
+    }} catch (error) {{
+      submitting = false;
+      show("验证失败或已过期，请返回 Telegram 重新获取验证入口。", false);
+      if (window.turnstile && widgetId !== null) window.turnstile.reset(widgetId);
+    }}
+  }}
+
+  if (tg) {{
+    tg.ready();
+    tg.expand();
+  }}
+  window.addEventListener("load", function () {{
+    if (!window.turnstile) {{
+      show("验证组件加载失败，请检查网络后重试。", false);
+      return;
+    }}
+    widgetId = window.turnstile.render("#widget", {{
+      sitekey: siteKey,
+      action: expectedAction,
+      callback: submitToken,
+      "expired-callback": function () {{ submitting = false; show("验证已过期，请重新操作。", false); }},
+      "error-callback": function () {{ submitting = false; show("验证组件暂时不可用，请稍后重试。", false); }}
+    }});
+    show("请完成下方 Cloudflare 验证。", false);
+  }});
+}})();
+</script>
+</body>
+</html>"""
+
+
+def apply_verification_security_headers(response: Response, csp_nonce: str = "") -> Response:
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if csp_nonce:
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; "
+            f"script-src 'nonce-{csp_nonce}' https://telegram.org https://challenges.cloudflare.com; "
+            f"style-src 'nonce-{csp_nonce}'; "
+            "frame-src https://challenges.cloudflare.com; "
+            "connect-src 'self' https://challenges.cloudflare.com; "
+            "img-src data: https:; "
+            "base-uri 'none'; form-action 'self'; "
+            "frame-ancestors https://web.telegram.org https://*.telegram.org"
+        )
+    return response
+
+
+def request_client_ip(request: Request) -> str:
+    client = getattr(request, "client", None)
+    address = str(getattr(client, "host", "") or "unknown")
+    return address[:128]
+
+
 def login_page(error: str = "") -> str:
     err = f"<div class='login-error'>{html_escape(error)}</div>" if error else ""
     return f"""<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>
@@ -2650,7 +3571,7 @@ html[data-theme='dark'] .theme-toggle{{background:rgba(255,255,255,.06)}}
 
 def env_values() -> dict[str, str]:
     load_dotenv(ENV_PATH, override=True)
-    return {
+    values = {
         "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
         "ADMIN_CHAT_ID": os.getenv("ADMIN_CHAT_ID", ""),
         "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO"),
@@ -2666,6 +3587,13 @@ def env_values() -> dict[str, str]:
         "TG_API_SESSION": os.getenv("TG_API_SESSION", ""),
         "TG_PROXY": os.getenv("TG_PROXY", ""),
     }
+    values.update(
+        {
+            key: os.getenv(key, default)
+            for key, default in VERIFICATION_ENV_DEFAULTS.items()
+        }
+    )
+    return values
 
 
 def write_env_values(values: dict[str, str]) -> None:
@@ -2675,33 +3603,177 @@ def write_env_values(values: dict[str, str]) -> None:
             if "=" in line and not line.lstrip().startswith("#"):
                 key, value = line.split("=", 1)
                 existing[key.strip()] = value.strip()
+
+    def clean_env_value(value: Any) -> str:
+        return str(value if value is not None else "").replace("\r", "").replace("\n", "")
+
+    def selected_value(key: str, default: str = "") -> str:
+        if key in values:
+            return clean_env_value(values[key])
+        return clean_env_value(existing.get(key, default))
+
     session_value = values.get("WEB_PANEL_SESSION_SECRET") or existing.get("WEB_PANEL_SESSION_SECRET", "")
     cookie_secure_value = values.get("WEB_PANEL_COOKIE_SECURE")
     if cookie_secure_value is None:
         cookie_secure_value = existing.get("WEB_PANEL_COOKIE_SECURE", "")
     lines = [
         "# tg-watchbot environment",
-        f"TELEGRAM_BOT_TOKEN={values.get('TELEGRAM_BOT_TOKEN','')}",
-        f"ADMIN_CHAT_ID={values.get('ADMIN_CHAT_ID','')}",
-        f"LOG_LEVEL={values.get('LOG_LEVEL','INFO')}",
+        f"TELEGRAM_BOT_TOKEN={selected_value('TELEGRAM_BOT_TOKEN')}",
+        f"ADMIN_CHAT_ID={selected_value('ADMIN_CHAT_ID')}",
+        f"LOG_LEVEL={selected_value('LOG_LEVEL', 'INFO')}",
         "",
         "# Web 管理面板；默认只监听本机，建议用 SSH 隧道或反代再暴露",
-        f"WEB_PANEL_ENABLED={values.get('WEB_PANEL_ENABLED','true')}",
-        f"WEB_PANEL_HOST={values.get('WEB_PANEL_HOST','127.0.0.1')}",
-        f"WEB_PANEL_PORT={values.get('WEB_PANEL_PORT','8765')}",
-        f"WEB_PANEL_USER={values.get('WEB_PANEL_USER','admin')}",
-        f"WEB_PANEL_PASSWORD={values.get('WEB_PANEL_PASSWORD','admin')}",
-        f"WEB_PANEL_SESSION_SECRET={session_value}",
-        f"WEB_PANEL_COOKIE_SECURE={cookie_secure_value}",
-        f"TG_API_ID={values.get('TG_API_ID','')}",
-        f"TG_API_HASH={values.get('TG_API_HASH','')}",
-        f"TG_API_SESSION={values.get('TG_API_SESSION','')}",
-        f"TG_PROXY={values.get('TG_PROXY','')}",
+        f"WEB_PANEL_ENABLED={selected_value('WEB_PANEL_ENABLED', 'true')}",
+        f"WEB_PANEL_HOST={selected_value('WEB_PANEL_HOST', '127.0.0.1')}",
+        f"WEB_PANEL_PORT={selected_value('WEB_PANEL_PORT', '8765')}",
+        f"WEB_PANEL_USER={selected_value('WEB_PANEL_USER', 'admin')}",
+        f"WEB_PANEL_PASSWORD={selected_value('WEB_PANEL_PASSWORD', 'admin')}",
+        f"WEB_PANEL_SESSION_SECRET={clean_env_value(session_value)}",
+        f"WEB_PANEL_COOKIE_SECURE={clean_env_value(cookie_secure_value)}",
+        "",
+        "# Telegram 用户会话（可选）",
+        f"TG_API_ID={selected_value('TG_API_ID')}",
+        f"TG_API_HASH={selected_value('TG_API_HASH')}",
+        f"TG_API_SESSION={selected_value('TG_API_SESSION')}",
+        f"TG_PROXY={selected_value('TG_PROXY')}",
+        "",
+        "# 新用户两阶段验证（Turnstile + 算数题）",
+        *[
+            f"{key}={selected_value(key, default)}"
+            for key, default in VERIFICATION_ENV_DEFAULTS.items()
+        ],
         "",
     ]
+    known_keys = {
+        line.split("=", 1)[0]
+        for line in lines
+        if "=" in line and not line.lstrip().startswith("#")
+    }
+    unknown_lines = [
+        f"{key}={clean_env_value(value)}"
+        for key, value in existing.items()
+        if key not in known_keys
+    ]
+    if unknown_lines:
+        lines.extend(["# 其他已有环境变量（由设置页原样保留）", *unknown_lines, ""])
     ENV_PATH.write_text("\n".join(lines), encoding="utf-8")
     ENV_PATH.chmod(0o600)
     load_dotenv(ENV_PATH, override=True)
+
+
+def form_value_is_true(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def normalize_verification_form_values(values: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(values)
+    current = env_values()
+    enabled_value = values.get("BOT_VERIFICATION_ENABLED")
+    if enabled_value is None:
+        enabled_value = current.get("BOT_VERIFICATION_ENABLED", "false")
+    test_mode_value = values.get("TURNSTILE_TEST_MODE")
+    if test_mode_value is None:
+        test_mode_value = current.get("TURNSTILE_TEST_MODE", "false")
+    normalized["BOT_VERIFICATION_ENABLED"] = (
+        "true" if form_value_is_true(enabled_value) else "false"
+    )
+    normalized["TURNSTILE_TEST_MODE"] = (
+        "true" if form_value_is_true(test_mode_value) else "false"
+    )
+    for key, default in [
+        ("BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS", 300),
+        ("BOT_VERIFICATION_SESSION_TTL_SECONDS", DEFAULT_VERIFICATION_SESSION_TTL_SECONDS),
+        ("BOT_VERIFICATION_MATH_TTL_SECONDS", DEFAULT_VERIFICATION_MATH_TTL_SECONDS),
+        ("BOT_VERIFICATION_MATH_MAX_ATTEMPTS", DEFAULT_VERIFICATION_MATH_MAX_ATTEMPTS),
+        ("BOT_VERIFICATION_COOLDOWN_SECONDS", DEFAULT_VERIFICATION_COOLDOWN_SECONDS),
+        ("BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS", DEFAULT_VERIFICATION_PROMPT_INTERVAL_SECONDS),
+    ]:
+        raw_value = values.get(key)
+        if raw_value is None:
+            raw_value = current.get(key, str(default))
+        normalized[key] = str(max(1, safe_int(raw_value, default)))
+    normalized["BOT_VERIFICATION_PUBLIC_BASE_URL"] = str(
+        values.get("BOT_VERIFICATION_PUBLIC_BASE_URL")
+        if values.get("BOT_VERIFICATION_PUBLIC_BASE_URL") is not None
+        else current.get("BOT_VERIFICATION_PUBLIC_BASE_URL", "")
+    ).strip().rstrip("/")
+    normalized["TURNSTILE_SITE_KEY"] = str(
+        values.get("TURNSTILE_SITE_KEY")
+        if values.get("TURNSTILE_SITE_KEY") is not None
+        else current.get("TURNSTILE_SITE_KEY", "")
+    ).strip()
+    normalized["TURNSTILE_VERIFY_ENDPOINT"] = str(
+        values.get("TURNSTILE_VERIFY_ENDPOINT")
+        if values.get("TURNSTILE_VERIFY_ENDPOINT") is not None
+        else current.get("TURNSTILE_VERIFY_ENDPOINT", "")
+    ).strip()
+    normalized["TURNSTILE_EXPECTED_HOSTNAME"] = str(
+        values.get("TURNSTILE_EXPECTED_HOSTNAME")
+        if values.get("TURNSTILE_EXPECTED_HOSTNAME") is not None
+        else current.get("TURNSTILE_EXPECTED_HOSTNAME", "")
+    ).strip().lower().rstrip(".")
+    action_value = values.get("TURNSTILE_EXPECTED_ACTION")
+    if action_value is None:
+        action_value = current.get("TURNSTILE_EXPECTED_ACTION", "turnstile-spin-v1")
+    normalized["TURNSTILE_EXPECTED_ACTION"] = (
+        str(action_value or "").strip()
+        or "turnstile-spin-v1"
+    )
+    return normalized
+
+
+def verification_admin_settings(values: dict[str, str]) -> dict[str, Any]:
+    return {
+        "enabled": form_value_is_true(values.get("BOT_VERIFICATION_ENABLED")),
+        "web_panel_enabled": form_value_is_true(values.get("WEB_PANEL_ENABLED", "true")),
+        "public_base_url": str(values.get("BOT_VERIFICATION_PUBLIC_BASE_URL") or "").strip().rstrip("/"),
+        "turnstile_site_key": str(values.get("TURNSTILE_SITE_KEY") or "").strip(),
+        "turnstile_verify_endpoint": str(values.get("TURNSTILE_VERIFY_ENDPOINT") or "").strip(),
+        "turnstile_expected_hostname": str(values.get("TURNSTILE_EXPECTED_HOSTNAME") or "").strip(),
+        "turnstile_expected_action": str(values.get("TURNSTILE_EXPECTED_ACTION") or "").strip(),
+        "turnstile_test_mode": form_value_is_true(values.get("TURNSTILE_TEST_MODE")),
+    }
+
+
+def verification_settings_form_html(values: dict[str, str], step_no: str = "3") -> str:
+    def attr(key: str, default: str = "") -> str:
+        return html.escape(str(values.get(key, default) or ""), quote=True)
+
+    enabled_checked = "checked" if form_value_is_true(values.get("BOT_VERIFICATION_ENABLED")) else ""
+    test_checked = "checked" if form_value_is_true(values.get("TURNSTILE_TEST_MODE")) else ""
+    config_error = turnstile_configuration_error(verification_admin_settings(values))
+    status_messages = {
+        "verification-disabled": "当前状态：验证功能已关闭（安全默认）。",
+        "web-panel-disabled": "当前状态：不可用；Web 面板关闭后无法提供 Mini App 页面。",
+        "missing-site-key": "当前状态：配置不完整；缺少 Turnstile Site Key。",
+        "invalid-public-base-url": "当前状态：配置不完整；公开地址无效。",
+        "test-mode-requires-loopback-host": "当前状态：测试模式只能使用 localhost、127.0.0.1 或 ::1。",
+        "missing-secure-verify-endpoint": "当前状态：配置不完整；生产环境需要 HTTPS Spin Worker 地址。",
+        "missing-expected-hostname": "当前状态：配置不完整；缺少预期 hostname。",
+        "missing-expected-action": "当前状态：配置不完整；缺少预期 action。",
+    }
+    status_text = (
+        "当前状态：必要参数完整；保存后新验证请求会使用这些配置。"
+        if not config_error
+        else status_messages.get(config_error, f"当前状态：不可用（{config_error}）。")
+    )
+    return f"""<div class=step><div class=step-title><span class=step-no>{html.escape(step_no, quote=True)}</span><span>新用户两阶段验证</span></div>
+<p class=muted>首次私聊的新用户先完成 Cloudflare Turnstile，再在 Telegram 回复算数题。这里不保存 Turnstile secret；生产 secret 只放在 Spin Worker。</p>
+<div class=check-row><label><input type=hidden name=BOT_VERIFICATION_ENABLED value=false><input type=checkbox name=BOT_VERIFICATION_ENABLED value=true {enabled_checked}> 启用新用户验证</label><label><input type=hidden name=TURNSTILE_TEST_MODE value=false><input type=checkbox name=TURNSTILE_TEST_MODE value=true {test_checked}> 本地测试模式</label></div>
+<div class=msg>{html_escape(status_text)}</div>
+<div class=grid><div><label>Mini App 公网根地址</label><input name=BOT_VERIFICATION_PUBLIC_BASE_URL value='{attr("BOT_VERIFICATION_PUBLIC_BASE_URL")}' placeholder='https://bot.example.com'></div>
+<div><label>Turnstile Site Key</label><input name=TURNSTILE_SITE_KEY value='{attr("TURNSTILE_SITE_KEY")}' placeholder='0x4AAAA...'></div>
+<div><label>Spin Siteverify Worker 地址</label><input name=TURNSTILE_VERIFY_ENDPOINT value='{attr("TURNSTILE_VERIFY_ENDPOINT")}' placeholder='https://turnstile-siteverify-example.workers.dev'></div>
+<div><label>预期 Hostname</label><input name=TURNSTILE_EXPECTED_HOSTNAME value='{attr("TURNSTILE_EXPECTED_HOSTNAME")}' placeholder='bot.example.com'></div>
+<div><label>预期 Action</label><input name=TURNSTILE_EXPECTED_ACTION value='{attr("TURNSTILE_EXPECTED_ACTION", "turnstile-spin-v1")}'></div>
+<div><label>initData 有效期（秒）</label><input name=BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS type=number min=1 value='{attr("BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS", "300")}'></div>
+<div><label>Turnstile 会话有效期（秒）</label><input name=BOT_VERIFICATION_SESSION_TTL_SECONDS type=number min=1 value='{attr("BOT_VERIFICATION_SESSION_TTL_SECONDS", "600")}'></div>
+<div><label>算数题有效期（秒）</label><input name=BOT_VERIFICATION_MATH_TTL_SECONDS type=number min=1 value='{attr("BOT_VERIFICATION_MATH_TTL_SECONDS", "600")}'></div>
+<div><label>算数题最多答错次数</label><input name=BOT_VERIFICATION_MATH_MAX_ATTEMPTS type=number min=1 value='{attr("BOT_VERIFICATION_MATH_MAX_ATTEMPTS", "3")}'></div>
+<div><label>失败冷却时间（秒）</label><input name=BOT_VERIFICATION_COOLDOWN_SECONDS type=number min=1 value='{attr("BOT_VERIFICATION_COOLDOWN_SECONDS", "600")}'></div>
+<div><label>重复提示间隔（秒）</label><input name=BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS type=number min=1 value='{attr("BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS", "15")}'></div></div>
+<div class=msg>生产环境：公开地址和 Worker 必须使用 HTTPS，并关闭测试模式。测试模式只允许 loopback，无法代替真实 Telegram Mini App 联调。</div>
+</div>"""
 
 
 def cfg_load_fresh() -> dict[str, Any]:
@@ -2858,6 +3930,7 @@ def monitor_from_form(
     url: str,
     interval_seconds: int,
     keywords: str,
+    exclude_keywords: str,
     item_selector: str,
     title_selector: str,
     link_selector: str,
@@ -2878,6 +3951,7 @@ def monitor_from_form(
             MIN_INTERVAL_SECONDS,
         ),
         "keywords": parse_lines(keywords),
+        "exclude_keywords": parse_lines(exclude_keywords),
         "notify_telegram": notify_telegram,
         "notify_on": {
             "keyword_match": keyword_match,
@@ -3026,6 +4100,7 @@ def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -
     selectors = m.get("selectors") or {}
     no = m.get("notify_on") or {}
     keywords = "\n".join(m.get("keywords") or [])
+    exclude_keywords = "\n".join(m.get("exclude_keywords") or [])
     action = "/monitor/save" if idx is not None else "/monitor/create"
     hidden = f"<input type=hidden name=original_index value='{idx}'>" if idx is not None else ""
     def checked(k: str) -> str:
@@ -3036,6 +4111,7 @@ def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -
 <div><label>URL</label><input name=url value='{html_escape(m.get('url',''))}' required></div>
 <div><label>间隔秒数（最低 1，默认 30）</label><input name=interval_seconds type=number min=1 value='{html_escape(m.get('interval_seconds', DEFAULT_MONITOR_INTERVAL_SECONDS))}'></div></div>
 <label>关键词（一行一个）</label><textarea name=keywords>{html_escape(keywords)}</textarea>
+<label>排除关键词（一行一个）</label><textarea name=exclude_keywords>{html_escape(exclude_keywords)}</textarea>
 <h3>Web 选择器（RSS 可忽略）</h3><div class=grid>
 <div><label>条目选择器</label><input name=item_selector value='{html_escape(selectors.get('item','article, .thread, .post, li'))}'></div>
 <div><label>标题选择器</label><input name=title_selector value='{html_escape(selectors.get('title','h1, h2, h3, a'))}'></div>
@@ -3096,9 +4172,23 @@ def create_panel_app() -> FastAPI:
 
     @app.middleware("http")
     async def require_login_middleware(request: Request, call_next):
-        public_paths = {"/login", "/health", "/favicon.ico"}
-        if request.url.path in public_paths or is_logged_in(request):
-            return await call_next(request)
+        path = request.url.path
+        if path == "/api/verify/turnstile":
+            content_length = request.headers.get("content-length", "")
+            try:
+                if content_length and int(content_length) > 16384:
+                    return apply_verification_security_headers(
+                        PlainTextResponse("request too large", status_code=413)
+                    )
+            except ValueError:
+                return apply_verification_security_headers(
+                    PlainTextResponse("invalid content length", status_code=400)
+                )
+        if panel_path_is_public(path) or is_logged_in(request):
+            response = await call_next(request)
+            if path in {"/verify/telegram", "/api/verify/turnstile"}:
+                apply_verification_security_headers(response)
+            return response
         return RedirectResponse("/login", status_code=303)
 
     @app.get("/login", response_class=HTMLResponse)
@@ -3122,6 +4212,72 @@ def create_panel_app() -> FastAPI:
         resp = RedirectResponse("/login", status_code=303)
         resp.delete_cookie("tg_watchbot_session")
         return resp
+
+    @app.get("/verify/telegram", response_class=HTMLResponse)
+    async def telegram_verification_page(nonce: str = "") -> Response:
+        values = verification_settings()
+        if (
+            turnstile_configuration_error(values)
+            or not nonce
+            or len(nonce) > 128
+            or not re.fullmatch(r"[A-Za-z0-9_-]+", nonce)
+        ):
+            response = HTMLResponse(
+                "<!doctype html><html lang=zh-CN><meta charset=utf-8>"
+                "<meta name=viewport content='width=device-width,initial-scale=1'>"
+                "<title>验证不可用</title><body><p>验证入口不可用或已失效，请返回 Telegram 重新获取。</p></body></html>",
+                status_code=503,
+            )
+            return apply_verification_security_headers(response)
+        csp_nonce = secrets.token_urlsafe(18)
+        response = HTMLResponse(
+            verification_page_html(nonce, values, csp_nonce),
+            status_code=200,
+        )
+        return apply_verification_security_headers(response, csp_nonce)
+
+    @app.post("/api/verify/turnstile")
+    async def telegram_verification_submit(
+        request: Request,
+        init_data: str = Form(""),
+        nonce: str = Form(""),
+        turnstile_token: str = Form("", alias="cf-turnstile-response"),
+    ) -> Response:
+        client_ip = request_client_ip(request)
+        if len(init_data) > 8192 or len(nonce) > 128 or len(turnstile_token) > 2048:
+            return JSONResponse(
+                {"ok": False, "error": "invalid-request"},
+                status_code=400,
+            )
+        session_rate_key = hashlib.sha256(init_data.encode("utf-8")).hexdigest()[:24]
+        if (
+            verification_api_rate_limited(f"ip:{client_ip}", max_requests=120)
+            or verification_api_rate_limited(f"session:{session_rate_key}")
+        ):
+            return JSONResponse(
+                {"ok": False, "error": "rate-limited"},
+                status_code=429,
+            )
+        result = await complete_turnstile_verification(
+            init_data,
+            nonce,
+            turnstile_token,
+            remote_ip=client_ip if client_ip != "unknown" else "",
+        )
+        error_statuses = {
+            "verification-unavailable": 503,
+            "invalid-telegram-session": 401,
+            "invalid-user": 401,
+            "invalid-or-expired-challenge": 409,
+            "challenge-already-used": 409,
+            "turnstile-failed": 400,
+            "turnstile-hostname-mismatch": 400,
+            "turnstile-action-mismatch": 400,
+        }
+        return JSONResponse(
+            result,
+            status_code=200 if result.get("ok") else error_statuses.get(str(result.get("error")), 400),
+        )
 
     @app.get("/", response_class=HTMLResponse)
     async def index(_: str = Depends(panel_auth)) -> str:
@@ -3438,7 +4594,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
             name, url = parts[0], parts[1]
             keywords = parts[2] if len(parts) >= 3 else ""
             try:
-                monitors.append(monitor_from_form(None, name, mtype, url, interval_seconds, keywords.replace(',', '\n'), "article, .thread, .post, li", "h1, h2, h3, a", "a", "", "", bool(keyword_match), bool(new_item), bool(price_change), bool(stock_change), bool(notify_telegram)))
+                monitors.append(monitor_from_form(None, name, mtype, url, interval_seconds, keywords.replace(',', '\n'), "", "article, .thread, .post, li", "h1, h2, h3, a", "a", "", "", bool(keyword_match), bool(new_item), bool(price_change), bool(stock_change), bool(notify_telegram)))
                 added += 1
             except Exception as e:
                 errors.append(f"第 {line_no} 行失败：{html_escape(e)}")
@@ -3465,6 +4621,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         url: str,
         interval_seconds: int,
         keywords: str,
+        exclude_keywords: str,
         item_selector: str,
         title_selector: str,
         link_selector: str,
@@ -3478,7 +4635,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
     ) -> RedirectResponse:
         cfg = cfg_load_fresh()
         monitors = cfg.setdefault("monitors", [])
-        m = monitor_from_form(original_index, name, mtype, url, interval_seconds, keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, bool(keyword_match), bool(new_item), bool(price_change), bool(stock_change), bool(notify_telegram))
+        m = monitor_from_form(original_index, name, mtype, url, interval_seconds, keywords, exclude_keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, bool(keyword_match), bool(new_item), bool(price_change), bool(stock_change), bool(notify_telegram))
         if original_index is None:
             monitors.append(m)
         else:
@@ -3491,12 +4648,12 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         return RedirectResponse("/", status_code=303)
 
     @app.post("/monitor/create")
-    async def create_monitor(_: str = Depends(panel_auth), name: str = Form(...), mtype: str = Form(...), url: str = Form(...), interval_seconds: int = Form(DEFAULT_MONITOR_INTERVAL_SECONDS), keywords: str = Form(""), item_selector: str = Form(""), title_selector: str = Form(""), link_selector: str = Form(""), price_selector: str = Form(""), stock_selector: str = Form(""), keyword_match: str | None = Form(None), new_item: str | None = Form(None), price_change: str | None = Form(None), stock_change: str | None = Form(None), notify_telegram: str | None = Form(None)) -> RedirectResponse:
-        return await save_form_common(None, name, mtype, url, interval_seconds, keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, keyword_match, new_item, price_change, stock_change, notify_telegram)
+    async def create_monitor(_: str = Depends(panel_auth), name: str = Form(...), mtype: str = Form(...), url: str = Form(...), interval_seconds: int = Form(DEFAULT_MONITOR_INTERVAL_SECONDS), keywords: str = Form(""), exclude_keywords: str = Form(""), item_selector: str = Form(""), title_selector: str = Form(""), link_selector: str = Form(""), price_selector: str = Form(""), stock_selector: str = Form(""), keyword_match: str | None = Form(None), new_item: str | None = Form(None), price_change: str | None = Form(None), stock_change: str | None = Form(None), notify_telegram: str | None = Form(None)) -> RedirectResponse:
+        return await save_form_common(None, name, mtype, url, interval_seconds, keywords, exclude_keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, keyword_match, new_item, price_change, stock_change, notify_telegram)
 
     @app.post("/monitor/save")
-    async def save_monitor(_: str = Depends(panel_auth), original_index: int = Form(...), name: str = Form(...), mtype: str = Form(...), url: str = Form(...), interval_seconds: int = Form(DEFAULT_MONITOR_INTERVAL_SECONDS), keywords: str = Form(""), item_selector: str = Form(""), title_selector: str = Form(""), link_selector: str = Form(""), price_selector: str = Form(""), stock_selector: str = Form(""), keyword_match: str | None = Form(None), new_item: str | None = Form(None), price_change: str | None = Form(None), stock_change: str | None = Form(None), notify_telegram: str | None = Form(None)) -> RedirectResponse:
-        return await save_form_common(original_index, name, mtype, url, interval_seconds, keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, keyword_match, new_item, price_change, stock_change, notify_telegram)
+    async def save_monitor(_: str = Depends(panel_auth), original_index: int = Form(...), name: str = Form(...), mtype: str = Form(...), url: str = Form(...), interval_seconds: int = Form(DEFAULT_MONITOR_INTERVAL_SECONDS), keywords: str = Form(""), exclude_keywords: str = Form(""), item_selector: str = Form(""), title_selector: str = Form(""), link_selector: str = Form(""), price_selector: str = Form(""), stock_selector: str = Form(""), keyword_match: str | None = Form(None), new_item: str | None = Form(None), price_change: str | None = Form(None), stock_change: str | None = Form(None), notify_telegram: str | None = Form(None)) -> RedirectResponse:
+        return await save_form_common(original_index, name, mtype, url, interval_seconds, keywords, exclude_keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, keyword_match, new_item, price_change, stock_change, notify_telegram)
 
     @app.get("/monitor/{idx}/delete")
     async def delete_monitor(idx: int, _: str = Depends(panel_auth)) -> RedirectResponse:
@@ -3587,7 +4744,8 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
 <div class=actions><button class='btn ok' type=button onclick='startTgQrLogin()'>二维码登录</button><button class='btn danger' type=button onclick='logoutTgSession()'>登出会话</button></div>
 <div id=tgQrPanel class=step style='display:none'><div class=step-title><span class=step-no>QR</span><span>扫码登录 Telegram</span></div><p class=muted id=tgQrText>正在生成二维码...</p><div id=tgQrImage></div></div>
 </div>
-<div class=step><div class=step-title><span class=step-no>3</span><span>高级设置</span></div>
+{verification_settings_form_html(v, "3")}
+<div class=step><div class=step-title><span class=step-no>4</span><span>高级设置</span></div>
 <p class=muted>一般保持默认即可。</p>
 <div class=grid><div><label>日志级别</label><input name=LOG_LEVEL value='{html_escape(v['LOG_LEVEL'])}'></div><div><label>面板监听地址</label><input name=WEB_PANEL_HOST value='{html_escape(v['WEB_PANEL_HOST'])}'></div><div><label>面板端口</label><input name=WEB_PANEL_PORT value='{html_escape(v['WEB_PANEL_PORT'])}'></div><div><label>面板用户</label><input name=WEB_PANEL_USER value='{html_escape(v['WEB_PANEL_USER'])}'></div><div><label>面板密码</label><input name=WEB_PANEL_PASSWORD value='{html_escape(v['WEB_PANEL_PASSWORD'])}'></div></div>
 <div class=msg>公网提示：监听地址填 <code>0.0.0.0</code> 会让面板监听所有网卡；Docker 是否暴露公网还取决于 <code>docker-compose.yml</code> 的端口映射和服务器防火墙。个人部署建议保持 <code>127.0.0.1</code>，用 SSH 隧道、反代或 Cloudflare Tunnel 访问。</div>
@@ -3630,7 +4788,7 @@ async function logoutTgSession() {{
         cleanup_message_delete_after_minutes: int,
         cleanup_retention_minutes: int,
     ) -> None:
-        write_env_values(values)
+        write_env_values(normalize_verification_form_values(values))
         cfg = cfg_load_fresh()
         cfg["cleanup"] = {
             "enabled": True,
@@ -3641,9 +4799,39 @@ async function logoutTgSession() {{
         cfg_save(cfg)
 
     @app.post("/settings", response_class=HTMLResponse)
-    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), TG_PROXY: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
+    async def settings_save(
+        _: str = Depends(panel_auth),
+        TELEGRAM_BOT_TOKEN: str = Form(""),
+        ADMIN_CHAT_ID: str = Form(""),
+        TG_API_ID: str = Form(""),
+        TG_API_HASH: str = Form(""),
+        TG_API_SESSION: str = Form(""),
+        TG_PROXY: str = Form(""),
+        LOG_LEVEL: str = Form("INFO"),
+        WEB_PANEL_ENABLED: str = Form("true"),
+        WEB_PANEL_HOST: str = Form("127.0.0.1"),
+        WEB_PANEL_PORT: str = Form("8765"),
+        WEB_PANEL_USER: str = Form("admin"),
+        WEB_PANEL_PASSWORD: str = Form("admin"),
+        BOT_VERIFICATION_ENABLED: str | None = Form(None),
+        BOT_VERIFICATION_PUBLIC_BASE_URL: str | None = Form(None),
+        BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS: str | None = Form(None),
+        BOT_VERIFICATION_SESSION_TTL_SECONDS: str | None = Form(None),
+        BOT_VERIFICATION_MATH_TTL_SECONDS: str | None = Form(None),
+        BOT_VERIFICATION_MATH_MAX_ATTEMPTS: str | None = Form(None),
+        BOT_VERIFICATION_COOLDOWN_SECONDS: str | None = Form(None),
+        BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS: str | None = Form(None),
+        TURNSTILE_SITE_KEY: str | None = Form(None),
+        TURNSTILE_VERIFY_ENDPOINT: str | None = Form(None),
+        TURNSTILE_EXPECTED_HOSTNAME: str | None = Form(None),
+        TURNSTILE_EXPECTED_ACTION: str | None = Form(None),
+        TURNSTILE_TEST_MODE: str | None = Form(None),
+        CLEANUP_INTERVAL_MINUTES: int = Form(60),
+        CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60),
+        CLEANUP_RETENTION_MINUTES: int = Form(1440),
+    ) -> str:
         save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES)
-        return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token、管理员 ID、端口或监听地址后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
+        return layout("已保存", "<div class=msg>已保存。验证参数会用于后续请求；修改 Token、管理员 ID、端口或监听地址后仍需重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
 
     @app.get("/send", response_class=HTMLResponse)
@@ -3766,6 +4954,8 @@ async function logoutTgSession() {{
 <h3>TG 用户会话（可选）</h3><p class=muted>仅用于 TG 群监听来源=用户会话。修改后需重启。</p>
 <div class=grid><div><label>TG_API_ID</label><input name=TG_API_ID value='{html_escape(v['TG_API_ID'])}'></div><div><label>TG_API_HASH</label><input name=TG_API_HASH value='{html_escape(v['TG_API_HASH'])}'></div></div>
 <label>TG_API_SESSION</label><textarea name=TG_API_SESSION>{html_escape(v['TG_API_SESSION'])}</textarea>
+<label>TG 代理（可选）</label><input name=TG_PROXY value='{html_escape(v['TG_PROXY'])}' placeholder='socks5://127.0.0.1:1080'>
+{verification_settings_form_html(v, "CF")}
 <div class=grid><div><label>日志级别</label><input name=LOG_LEVEL value='{html_escape(v['LOG_LEVEL'])}'></div><div><label>面板监听地址</label><input name=WEB_PANEL_HOST value='{html_escape(v['WEB_PANEL_HOST'])}'></div><div><label>面板端口</label><input name=WEB_PANEL_PORT value='{html_escape(v['WEB_PANEL_PORT'])}'></div><div><label>面板用户</label><input name=WEB_PANEL_USER value='{html_escape(v['WEB_PANEL_USER'])}'></div><div><label>面板密码</label><input name=WEB_PANEL_PASSWORD value='{html_escape(v['WEB_PANEL_PASSWORD'])}'></div></div>
 <div class=msg>公网提示：监听地址填 <code>0.0.0.0</code> 会监听所有网卡；Docker 是否暴露公网还取决于 <code>docker-compose.yml</code> 的端口映射和服务器防火墙。</div>
 <input type=hidden name=WEB_PANEL_ENABLED value='true'><div class=form-actions><button class='btn primary' type=submit>保存配置</button> <a class=btn href='/restart'>重启机器人</a></div></form></div>"""
@@ -3773,7 +4963,34 @@ async function logoutTgSession() {{
         return layout("用户管理", body)
 
     @app.post("/users/settings", response_class=HTMLResponse)
-    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), TG_PROXY: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
+    async def users_settings_save(
+        _: str = Depends(panel_auth),
+        TELEGRAM_BOT_TOKEN: str = Form(""),
+        ADMIN_CHAT_ID: str = Form(""),
+        TG_API_ID: str = Form(""),
+        TG_API_HASH: str = Form(""),
+        TG_API_SESSION: str = Form(""),
+        TG_PROXY: str = Form(""),
+        LOG_LEVEL: str = Form("INFO"),
+        WEB_PANEL_ENABLED: str = Form("true"),
+        WEB_PANEL_HOST: str = Form("127.0.0.1"),
+        WEB_PANEL_PORT: str = Form("8765"),
+        WEB_PANEL_USER: str = Form("admin"),
+        WEB_PANEL_PASSWORD: str = Form("admin"),
+        BOT_VERIFICATION_ENABLED: str | None = Form(None),
+        BOT_VERIFICATION_PUBLIC_BASE_URL: str | None = Form(None),
+        BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS: str | None = Form(None),
+        BOT_VERIFICATION_SESSION_TTL_SECONDS: str | None = Form(None),
+        BOT_VERIFICATION_MATH_TTL_SECONDS: str | None = Form(None),
+        BOT_VERIFICATION_MATH_MAX_ATTEMPTS: str | None = Form(None),
+        BOT_VERIFICATION_COOLDOWN_SECONDS: str | None = Form(None),
+        BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS: str | None = Form(None),
+        TURNSTILE_SITE_KEY: str | None = Form(None),
+        TURNSTILE_VERIFY_ENDPOINT: str | None = Form(None),
+        TURNSTILE_EXPECTED_HOSTNAME: str | None = Form(None),
+        TURNSTILE_EXPECTED_ACTION: str | None = Form(None),
+        TURNSTILE_TEST_MODE: str | None = Form(None),
+    ) -> str:
         cleanup = (cfg_load_fresh().get("cleanup") or {})
         save_panel_settings(
             locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED},
@@ -3781,7 +4998,7 @@ async function logoutTgSession() {{
             int(cleanup.get("monitor_message_delete_after_minutes", 60)),
             int(cleanup.get("monitor_retention_minutes", 1440)),
         )
-        return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token、管理员 ID、端口、监听地址、账号或密码后请重启。</div><p><a class=btn href='/users'>返回用户管理</a> <a class=btn href='/restart'>重启机器人</a></p>")
+        return layout("已保存", "<div class=msg>已保存。验证参数会用于后续请求；修改 Token、管理员 ID、端口、监听地址、账号或密码后仍需重启。</div><p><a class=btn href='/users'>返回用户管理</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
     @app.post("/api/tg-login/qr")
     async def api_tg_login_qr(_: str = Depends(panel_auth)) -> dict[str, Any]:
@@ -4306,6 +5523,12 @@ async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
     config = load_config()
     setup_logging(os.getenv("LOG_LEVEL", "INFO"))
     init_db()
+    verification_error = turnstile_configuration_error()
+    if verification_settings()["enabled"] and verification_error:
+        logger.error(
+            "private verification is enabled but unavailable: %s",
+            verification_error,
+        )
     if panel_only:
         await start_panel_server()
         logger.info("panel-only mode start")

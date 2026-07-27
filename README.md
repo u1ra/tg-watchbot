@@ -16,6 +16,7 @@
 tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器人**、**Web/RSS 监控推送** 和 **群组/频道关键词监听** 合在一起：
 
 - 普通用户私聊 Bot，消息会转发给管理员；
+- 可选为首次私聊的新用户启用 Turnstile + 算数题两阶段验证；
 - 管理员可以直接回复、主动发文字/图片、封禁/备注用户；
 - 后台定时监控 RSS 或网页，命中关键词、新条目、价格/库存变化后推送给管理员；
 - 使用 Telethon 用户账号监听群组/频道消息，命中关键词后自动推送通知给管理员；
@@ -104,6 +105,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 普通用户有简单限流，防止刷屏。
 - 支持最多 3 个管理员 chat id，用逗号分隔配置。
 - 支持私聊广告关键词自动拦截和自动拉黑，不影响 RSS/Web 监控。
+- 可选的新用户验证会先校验 Cloudflare Turnstile，再在私聊中发送一道算数题；验证完成后用户需要重新发送原消息。
 
 ![示例图片](https://pic.gongyichuren.de/file/1779287173835_8521cab29a9635743a603582ceb7ba02.png)
 
@@ -119,7 +121,8 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
   - 库存变化。
 - 支持论坛 RSS 增强字段：作者、分类、tags、摘要。
 - 支持去重，避免同一条反复推送。
-- 支持屏蔽词、作者、分类过滤（YAML 高级配置）。
+- 支持在新增/编辑页面填写排除关键词；命中包含词和排除词时，排除优先。
+- 支持作者、分类过滤（YAML 高级配置）。
 - 单个监控可关闭 Telegram 推送，只记录到 Web 推送历史。
 - 默认监控间隔为 30 秒，最低可设为 1 秒；频率越高越容易被目标站限流。
 
@@ -358,6 +361,77 @@ curl http://127.0.0.1:8765/health
 | `TG_API_ID` | （可选）Telegram API ID，用于“TG 群监听=用户会话” |
 | `TG_API_HASH` | （可选）Telegram API Hash，用于“TG 群监听=用户会话” |
 | `TG_API_SESSION` | （可选）Telethon StringSession，用于“TG 群监听=用户会话” |
+| `BOT_VERIFICATION_ENABLED` | 是否为新私聊用户启用两阶段验证；默认 `false` |
+| `BOT_VERIFICATION_PUBLIC_BASE_URL` | Mini App 的公网 HTTPS 根地址，不包含 `/verify/telegram` |
+| `BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS` | Telegram Mini App `initData` 最大有效期，默认 `300` 秒 |
+| `BOT_VERIFICATION_SESSION_TTL_SECONDS` | Turnstile 入口会话有效期，默认 `600` 秒 |
+| `BOT_VERIFICATION_MATH_TTL_SECONDS` | 算数题有效期，默认 `600` 秒 |
+| `BOT_VERIFICATION_MATH_MAX_ATTEMPTS` | 算数题最多答错次数，默认 `3` |
+| `BOT_VERIFICATION_COOLDOWN_SECONDS` | 达到错误上限后的冷却时间，默认 `600` 秒 |
+| `BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS` | 重复验证提示的最小间隔，默认 `15` 秒 |
+| `TURNSTILE_SITE_KEY` | Turnstile 前端 sitekey；不是 secret |
+| `TURNSTILE_VERIFY_ENDPOINT` | 生产环境的 Turnstile Spin Siteverify Worker HTTPS 地址 |
+| `TURNSTILE_EXPECTED_HOSTNAME` | Siteverify 响应中必须匹配的正式 hostname，不含协议 |
+| `TURNSTILE_EXPECTED_ACTION` | Siteverify 响应中必须匹配的 action，默认 `turnstile-spin-v1` |
+| `TURNSTILE_TEST_MODE` | 是否使用 Cloudflare 官方测试 secret；只允许 loopback 地址，默认 `false` |
+
+### 新用户两阶段验证
+
+此功能默认关闭。启用后，首次私聊的新用户必须依次完成：
+
+1. 从 Bot 发出的 Web App 按钮打开 Mini App，并通过 Cloudflare Turnstile。
+2. 返回 Telegram，直接回复算数题的数字答案。
+
+管理员可以在 Web 面板的“设置 → 新用户两阶段验证”中修改全部非敏感参数；“用户管理”里的共享配置卡片也提供同一组字段。页面会显示当前配置是否完整。可编辑项包括功能开关、Mini App 地址、sitekey、Spin Worker 地址、预期 hostname/action、各阶段有效期、答错次数、冷却和提示间隔；WebUI 不提供生产 Turnstile secret 输入框。
+
+首次验证前发送的消息不会保存或转发；成功后 Bot 会要求用户重新发送。算数题 10 分钟过期，最多答错 3 次，达到上限后冷却 10 分钟并重新从 Turnstile 开始。管理员不受门禁影响，被封禁用户仍优先执行封禁。升级时数据库中已经存在的用户只会在一次性迁移中标记为历史已验证；之后出现的新用户不会因重启而自动放行。
+
+验证状态、题目和过期时间保存在 SQLite，可跨进程重启恢复。原始 nonce 只以哈希形式入库。后端会验证 Telegram `initData` 的 HMAC 与时效，并检查 Turnstile 的 `success`、`hostname` 和 `action`；浏览器显示成功本身不会使用户通过验证。
+
+#### 本地开发与测试
+
+无需 Cloudflare 账号即可运行自动化测试：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile app.py
+```
+
+测试会模拟 Turnstile 成功、失败、超时、hostname/action 不匹配、错误 nonce、过期 `initData`、重复和并发回调，不依赖生产账号或 secret。
+
+如只想在本机查看 Turnstile 测试组件，可临时使用 Cloudflare 的 [官方测试 sitekey](https://developers.cloudflare.com/turnstile/troubleshooting/testing/)：
+
+```dotenv
+BOT_VERIFICATION_ENABLED=true
+BOT_VERIFICATION_PUBLIC_BASE_URL=http://127.0.0.1:8765
+TURNSTILE_SITE_KEY=1x00000000000000000000AA
+TURNSTILE_TEST_MODE=true
+```
+
+测试模式只允许 `localhost`、`127.0.0.1` 或 `::1`，不会接受公网 hostname。Telegram Web App 按钮仍要求 HTTPS，而且浏览器直接打开时没有可信 Telegram `initData`，因此本机只能检查页面和自动化链路，不能冒充真实 Telegram 端到端通过。不要在连接真实用户的 Bot 上保留这组本地配置。
+
+#### 生产部署
+
+当前本地开发不会创建 Cloudflare widget 或部署 Worker。服务器部署时再执行以下步骤：
+
+1. 为本项目准备一个公网 HTTPS 地址，并保持 `WEB_PANEL_ENABLED=true`。
+2. 创建正式 Turnstile widget，将允许的 hostname 设为最终域名。
+3. 部署 Turnstile Spin Siteverify Worker，把 widget secret 只存入 Worker secret。
+4. 在本项目 `.env` 填写正式 `TURNSTILE_SITE_KEY`、Worker URL、预期 hostname/action，确认 `TURNSTILE_TEST_MODE=false` 后再启用门禁。
+
+生产配置示例：
+
+```dotenv
+BOT_VERIFICATION_ENABLED=true
+BOT_VERIFICATION_PUBLIC_BASE_URL=https://bot.example.com
+TURNSTILE_SITE_KEY=<正式 sitekey>
+TURNSTILE_VERIFY_ENDPOINT=https://turnstile-siteverify-example.workers.dev
+TURNSTILE_EXPECTED_HOSTNAME=bot.example.com
+TURNSTILE_EXPECTED_ACTION=turnstile-spin-v1
+TURNSTILE_TEST_MODE=false
+```
+
+Turnstile secret 不应写入本项目 `.env`、HTML、日志或 Git；这里只保存 Spin Worker 地址。Cloudflare 要求所有 token 都经过[服务端 Siteverify](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/)，且 token 只有 5 分钟有效并只能使用一次。本项目的 `/verify/telegram` 和 `/api/verify/turnstile` 是精确放行的公共入口，管理面板其他路由仍要求登录。缺少必要配置、验证端超时或返回异常时会失败关闭，不会自动放行用户。
 
 ### `config.yaml`
 
