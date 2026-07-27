@@ -215,19 +215,37 @@ Telegram 用户
 
 ### 第 2 步：在 VPS 启动 cloudflared
 
-放在独立目录，Token 不要写进 tg-watchbot 的 `.env`：
+这一步要做的事：在 VPS 上跑一个 `cloudflared` 容器，它拿着第 1 步的 Token 主动连上 Cloudflare，之后 Cloudflare 收到的 `bot-api.example.com` 请求就通过这条连接送到本机的 tg-watchbot：
+
+```text
+https://bot-api.example.com  →  Cloudflare  →  cloudflared 容器  →  127.0.0.1:8765（tg-watchbot）
+```
+
+Token 单独放在新目录里，**不要**写进 tg-watchbot 的 `.env`。
+
+**① 建目录（复制执行）：**
 
 ```bash
 sudo install -d -m 700 -o "$USER" -g "$(id -gn)" /opt/tg-watchbot-cloudflared
 cd /opt/tg-watchbot-cloudflared
-umask 077
-nano cloudflared.env    # 写入：TUNNEL_TOKEN=<粘贴 eyJ... 开头的 Token>
-chmod 600 cloudflared.env
 ```
 
-创建 `compose.yaml`：
+**② 写入 Token**——复制下面整段执行，然后在提示后**粘贴第 1 步的 Token 并回车**（输入不显示，是正常的）：
 
-```yaml
+```bash
+umask 077
+read -s -p "粘贴 Tunnel Token 后回车: " TUNNEL_TOKEN; echo
+printf 'TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" > cloudflared.env
+chmod 600 cloudflared.env
+unset TUNNEL_TOKEN
+```
+
+执行完 `cloudflared.env` 里就只有一行 `TUNNEL_TOKEN=eyJ...`，可以用 `ls -l cloudflared.env` 确认权限是 `-rw-------`。
+
+**③ 创建 `compose.yaml`**——整段复制执行即可，不用改任何地方：
+
+```bash
+cat > compose.yaml <<'EOF'
 services:
   cloudflared:
     image: cloudflare/cloudflared:latest
@@ -237,16 +255,36 @@ services:
     command: tunnel --no-autoupdate --loglevel info run
     env_file:
       - ./cloudflared.env
+EOF
 ```
 
-启动并检查：
+**④ 启动并看日志：**
 
 ```bash
 docker compose up -d
 docker compose logs --tail=100 cloudflared
 ```
 
-日志出现已注册 Tunnel 连接、控制台状态变为 `Healthy` 即正常。`network_mode: host` 让容器里的 `127.0.0.1:8765` 指向宿主机；如果你改用普通 Docker 网络，要换成 `http://tg-watchbot:8765` 并让两个容器在同一网络。
+看到类似下面的输出就是连上了（关键是有 4 条 `Registered tunnel connection`）：
+
+```text
+INF Registered tunnel connection connIndex=0 connection=... location=...
+INF Registered tunnel connection connIndex=1 connection=... location=...
+INF Registered tunnel connection connIndex=2 connection=... location=...
+INF Registered tunnel connection connIndex=3 connection=... location=...
+```
+
+这时回到 Cloudflare 控制台，Tunnel 状态会从 `Inactive` 变成 `Healthy`。
+
+> `network_mode: host` 的作用：让容器里的 `127.0.0.1:8765` 指的就是 VPS 宿主机，和 tg-watchbot 默认的端口绑定正好对上，所以什么网络都不用配。如果你不用 host 网络，容器里的 `127.0.0.1` 是容器自己，就连不上了——那种情况要让两个容器进同一个 Docker 网络，并把第 3 步的 Service URL 改成 `http://tg-watchbot:8765`。
+
+**连不上时按这个顺序查：**
+
+| 日志/状态 | 原因和处理 |
+|---|---|
+| `error parsing token` / `Invalid token` | Token 复制不全或多了空格，重新从控制台复制 |
+| 一直 `Retrying connection` | VPS 出站被防火墙拦了，放行出站 `7844` 端口 |
+| 日志正常但控制台一直 `Inactive` | 等 1-2 分钟刷新；还不行就重建容器 `docker compose up -d --force-recreate` |
 
 ### 第 3 步：添加 Published application 路由
 
