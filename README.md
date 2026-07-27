@@ -139,21 +139,22 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
    地址用途不得混用。
 4. 只有获得用户明确授权后才能创建或修改 Cloudflare 资源。按照 README 的“Cloudflare Tunnel（Docker 推荐）”章节创建远程管理 Tunnel，使用独立 cloudflared Docker 容器和 host network，把 Tunnel 公网 hostname 转发到 http://127.0.0.1:8765；Tunnel Token 不得写入主项目 .env。
 5. 创建 Turnstile Widget：模式使用 Managed，Pre-clearance 关闭，允许的 hostname 必须是“验证页面 Worker”的 hostname，不是 Tunnel 或 Siteverify Worker 的 hostname。
-6. 从配套仓库分别部署两个 Worker，少一个都不能启用：
+6. 在本机使用 `openssl rand -hex 32` 生成 Siteverify 共享鉴权 Token，然后从配套仓库分别部署两个 Worker，少一个都不能启用：
    - 验证页面 Worker：TG_WATCHBOT_ORIGIN=<Tunnel HTTPS 根地址>、TURNSTILE_SITE_KEY=<sitekey>、TURNSTILE_EXPECTED_ACTION=turnstile-spin-v1
-   - Siteverify Worker：TURNSTILE_SECRET_KEY=<Turnstile secret，必须保存为加密 Secret>、TURNSTILE_EXPECTED_HOSTNAME=<验证页面 Worker hostname>、TURNSTILE_EXPECTED_ACTION=turnstile-spin-v1
-7. 不要要求用户在聊天中粘贴 Turnstile secret、Cloudflare API Token、Tunnel Token 或 Bot Token；不要把任何 secret 写入主项目 .env、普通 Worker 变量、Git、命令参数或日志。
+   - Siteverify Worker：TURNSTILE_SECRET_KEY=<Turnstile secret，必须保存为加密 Secret>、SITEVERIFY_AUTH_TOKEN=<刚生成的共享鉴权 Token，必须保存为加密 Secret>、TURNSTILE_EXPECTED_HOSTNAME=<验证页面 Worker hostname>、TURNSTILE_EXPECTED_ACTION=turnstile-spin-v1
+7. 不要要求用户在聊天中粘贴 Turnstile secret、共享鉴权 Token、Cloudflare API Token、Tunnel Token 或 Bot Token；不要把它们写入 Git、命令参数或日志。Turnstile secret 只能保存在 Siteverify Worker；共享鉴权 Token 还需要以 `TURNSTILE_VERIFY_AUTH_TOKEN` 的名称保存在 tg-watchbot 服务端 `.env`。
 8. 在 tg-watchbot WebUI 中填写：
    - Mini App 公网根地址=<验证页面 Worker HTTPS 根地址，不加 /verify/telegram>
    - Turnstile Site Key=<同一个 sitekey>
    - Spin Siteverify Worker 地址=<Siteverify Worker HTTPS 根地址，不加 /health>
+   - Siteverify 鉴权 Token=<与 Worker 的 SITEVERIFY_AUTH_TOKEN 完全相同>
    - 预期 Hostname=<验证页面 Worker hostname，不带协议和路径>
    - 预期 Action=turnstile-spin-v1
    - 本地测试模式=false
    全部验证完成前保持“启用新用户验证”关闭。
-9. 检查 Siteverify Worker 的 /health 返回 ok；按照 Tunnel Docker 章节检查 /api/verify/turnstile 已经能到达 tg-watchbot，并确认验证页面 Worker 不返回 502/503。若 Tunnel hostname 使用 Cloudflare Access，必须保证该 API 不会被交互式登录拦截。
-10. 最后再启用新用户验证，使用一个从未私聊过 Bot 的 Telegram 账号完成 Turnstile、算数题和重新发送消息的端到端测试。旧用户不会触发首次验证，不能用来代替验收。
-11. 最终汇报三个非敏感 URL、hostname/action、Worker 健康状态、Tunnel 状态和端到端结果；不得输出 sitekey 以外的任何密钥内容。
+9. 检查 Siteverify Worker 的 /health 返回 ok；按照 Tunnel Docker 章节检查 /api/verify/turnstile 已经能到达 tg-watchbot，并确认验证页面 Worker 不返回 401/502/503。若 Tunnel hostname 使用 Cloudflare Access，必须保证该 API 不会被交互式登录拦截。
+10. 最后再启用新用户验证，使用非管理员 Telegram 账号完成 Turnstile、算数题和重新发送消息的端到端测试。可以使用从未私聊过 Bot 的账号，也可以在 WebUI“用户管理”中对现有账号点击“重置验证（测试）”；后者只清除该用户的验证状态，不删除资料或历史消息。
+11. 最终汇报三个非敏感 URL、hostname/action、是否已经配置两端共享鉴权、Worker 健康状态、Tunnel 状态和端到端结果；不得输出 sitekey 以外的任何密钥内容。
 ```
 
 ## 更新日志
@@ -164,6 +165,9 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 新增可选的新用户 Turnstile + 算数题两阶段验证，老用户一次性免验证。
 - 新增 Telegram Mini App、服务端 `initData` 验签、nonce 防重放、过期、失败冷却与安全响应头。
 - “设置”和“用户管理”均可维护全部非敏感验证参数；生产 Turnstile secret 仍只保存在配套 Siteverify Worker。
+- Siteverify Worker 新增可选 Bearer 鉴权；tg-watchbot 新增 `TURNSTILE_VERIFY_AUTH_TOKEN` 配置和 WebUI 密码输入框，请求时自动携带与 Worker `SITEVERIFY_AUTH_TOKEN` 相同的值。
+- “用户管理”新增验证状态显示和“重置验证（测试）”操作，可让指定非管理员用户重新完成 Turnstile + 算数题，同时保留用户资料、备注、封禁状态和历史消息。
+- 补充共享鉴权失败的 `401` 排查说明，并明确本地测试模式只切换 Cloudflare 测试密钥，不会改变新老用户的验证范围。
 - 新用户验证默认关闭，生产 Cloudflare 资源与真实 Telegram 联调需在最终 HTTPS 域名确定后执行。
 - 补充配套项目 [`tg-watchbot-verify`](https://github.com/u1ra/tg-watchbot-verify) 的联合部署说明，明确 Cloudflare Tunnel、验证页面 Worker、Siteverify Worker 和 WebUI 字段之间的对应关系。
 - 新增独立的 Cloudflare Tunnel Docker 部署教程，覆盖 Tunnel 创建、Token 保存、host network、Published application、Access 策略、连通性验证与 Token 轮换。
@@ -745,6 +749,8 @@ curl http://127.0.0.1:8765/health
 管理员可以在 Web 面板的“设置 → 新用户两阶段验证”中修改验证参数；“用户管理”里的共享配置卡片也提供同一组字段。页面会显示当前配置是否完整。可编辑项包括功能开关、Mini App 地址、sitekey、Siteverify Worker 地址、Siteverify 鉴权 Token、预期 hostname/action、各阶段有效期、答错次数、冷却和提示间隔。鉴权 Token 使用密码输入框并只保存在服务端 `.env`；WebUI 不提供生产 Turnstile secret 输入框。Turnstile secret 必须以 `TURNSTILE_SECRET_KEY` 的名称保存在配套 Siteverify Worker 的加密 Secret 中。
 
 “用户管理”列表会显示每个用户当前的验证状态。需要使用现有非管理员账号重新测试完整流程时，可以点击“重置验证（测试）”；该操作只清除目标用户的验证记录和提示间隔缓存，不删除用户资料、备注或历史消息。用户下次私聊 Bot 时会重新进入 Turnstile + 算数题流程。管理员账号始终免验证，因此不会显示重置按钮。
+
+“本地测试模式”和“重置验证（测试）”用途不同：前者让后端使用 Cloudflare 官方测试密钥并限制为 loopback 地址，不改变哪些用户需要验证；后者只重置一个现有非管理员用户的验证状态，可用于生产链路的定向端到端验收。
 
 首次验证前发送的消息不会保存或转发；成功后 Bot 会要求用户重新发送。算数题 10 分钟过期，最多答错 3 次，达到上限后冷却 10 分钟并重新从 Turnstile 开始。管理员不受门禁影响，被封禁用户仍优先执行封禁。升级时数据库中已经存在的用户只会在一次性迁移中标记为历史已验证；之后出现的新用户不会因重启而自动放行。
 
