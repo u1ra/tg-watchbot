@@ -5,6 +5,7 @@
   <p>
     <a href="#ai-one-line-install">AI 辅助部署</a> ·
     <a href="#docker-install">Docker 安装</a> ·
+    <a href="#cloudflare-tunnel-docker">Tunnel Docker 部署</a> ·
     <a href="#manual-install">手动安装</a> ·
     <a href="#systemd-install">systemd 部署</a> ·
     <a href="#turnstile-production">新用户验证部署</a> ·
@@ -132,7 +133,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
    - Tunnel 地址，例如 https://bot-api.example.com
    - Siteverify Worker 地址，例如 https://tg-watchbot-siteverify.example.workers.dev
    地址用途不得混用。
-4. 只有获得用户明确授权后才能创建或修改 Cloudflare 资源。为 VPS 创建 Cloudflare Tunnel，把 Tunnel 公网 hostname 转发到 http://127.0.0.1:8765；若 cloudflared 在 Docker 中，先处理容器网络，不能误用容器自己的 127.0.0.1。
+4. 只有获得用户明确授权后才能创建或修改 Cloudflare 资源。按照 README 的“Cloudflare Tunnel（Docker 推荐）”章节创建远程管理 Tunnel，使用独立 cloudflared Docker 容器和 host network，把 Tunnel 公网 hostname 转发到 http://127.0.0.1:8765；Tunnel Token 不得写入主项目 .env。
 5. 创建 Turnstile Widget：模式使用 Managed，Pre-clearance 关闭，允许的 hostname 必须是“验证页面 Worker”的 hostname，不是 Tunnel 或 Siteverify Worker 的 hostname。
 6. 从配套仓库分别部署两个 Worker，少一个都不能启用：
    - 验证页面 Worker：TG_WATCHBOT_ORIGIN=<Tunnel HTTPS 根地址>、TURNSTILE_SITE_KEY=<sitekey>、TURNSTILE_EXPECTED_ACTION=turnstile-spin-v1
@@ -146,7 +147,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
    - 预期 Action=turnstile-spin-v1
    - 本地测试模式=false
    全部验证完成前保持“启用新用户验证”关闭。
-9. 检查 Siteverify Worker 的 /health 返回 ok；确认 Tunnel 能访问 tg-watchbot 的 /health，并确认验证页面 Worker 不返回 502/503。若 Tunnel hostname 使用 Cloudflare Access，必须保证 /api/verify/turnstile 不会被交互式登录拦截。
+9. 检查 Siteverify Worker 的 /health 返回 ok；按照 Tunnel Docker 章节检查 /api/verify/turnstile 已经能到达 tg-watchbot，并确认验证页面 Worker 不返回 502/503。若 Tunnel hostname 使用 Cloudflare Access，必须保证该 API 不会被交互式登录拦截。
 10. 最后再启用新用户验证，使用一个从未私聊过 Bot 的 Telegram 账号完成 Turnstile、算数题和重新发送消息的端到端测试。旧用户不会触发首次验证，不能用来代替验收。
 11. 最终汇报三个非敏感 URL、hostname/action、Worker 健康状态、Tunnel 状态和端到端结果；不得输出 sitekey 以外的任何密钥内容。
 ```
@@ -161,6 +162,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - “设置”和“用户管理”均可维护全部非敏感验证参数；生产 Turnstile secret 仍只保存在配套 Siteverify Worker。
 - 新用户验证默认关闭，生产 Cloudflare 资源与真实 Telegram 联调需在最终 HTTPS 域名确定后执行。
 - 补充配套项目 [`tg-watchbot-verify`](https://github.com/u1ra/tg-watchbot-verify) 的联合部署说明，明确 Cloudflare Tunnel、验证页面 Worker、Siteverify Worker 和 WebUI 字段之间的对应关系。
+- 新增独立的 Cloudflare Tunnel Docker 部署教程，覆盖 Tunnel 创建、Token 保存、host network、Published application、Access 策略、连通性验证与 Token 轮换。
 
 ### 2026-06-02 更新
 
@@ -353,6 +355,239 @@ docker compose restart
 docker compose up -d --build
 ```
 
+<a id="cloudflare-tunnel-docker"></a>
+
+## Cloudflare Tunnel（Docker 推荐）
+
+本节从零创建一个**远程管理的 Cloudflare Tunnel**，使用独立 Docker 容器运行 `cloudflared`，把公网 HTTPS hostname 安全转发到 VPS 上仅监听 `127.0.0.1:8765` 的 tg-watchbot。Cloudflare Tunnel 通过出站连接接入 Cloudflare，不需要开放 VPS 的 `8765`、`80` 或 `443` 入站端口。
+
+新用户验证配套方案中，建议为验证 API 单独准备一个 hostname：
+
+```text
+https://bot-api.example.com
+  → Cloudflare Tunnel
+  → cloudflared Docker 容器（host network）
+  → http://127.0.0.1:8765
+  → tg-watchbot
+```
+
+这个地址以后填写到验证页面 Worker 的：
+
+```text
+TG_WATCHBOT_ORIGIN=https://bot-api.example.com
+```
+
+它不是 Telegram Mini App 地址，也不是 Siteverify Worker 地址。
+
+### 1. 开始前检查
+
+需要准备：
+
+- 一个已经接入 Cloudflare DNS 的域名，例如 `example.com`；
+- 一台已经安装 Docker 与 Docker Compose 的 Linux VPS；
+- 已经运行的 tg-watchbot；
+- 一个未被其他 DNS 记录占用的 hostname，例如 `bot-api.example.com`。
+
+先在 VPS 确认 tg-watchbot 正常运行：
+
+```bash
+cd /opt/tg-watchbot
+docker compose ps
+curl --fail --silent --show-error http://127.0.0.1:8765/login >/dev/null
+```
+
+如果实际安装目录不是 `/opt/tg-watchbot`，请替换成自己的目录。这里失败时先修复 tg-watchbot，不要继续创建 Tunnel。
+
+### 2. 在 Cloudflare 控制台创建 Tunnel
+
+按照 Cloudflare 当前的[远程管理 Tunnel 创建指引](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/get-started/create-remote-tunnel/)：
+
+1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)。
+2. 进入 `Networking → Tunnels`。
+3. 点击 `Create a tunnel`。
+4. Connector 选择 `Cloudflared`。
+5. Tunnel 名称建议填写 `tg-watchbot-vps`。
+6. 点击 `Save tunnel` 或 `Create Tunnel`。
+7. 在安装环境中选择 `Docker`。
+8. 页面会显示一条包含 `--token eyJ...` 的 Docker 命令。**不要直接把整条命令粘贴到聊天、工单或公开日志**，只在本地临时文本中取出 `eyJ...` 开头的 Tunnel Token。
+
+Tunnel Token 相当于这条 Tunnel 的运行凭证；任何拿到 Token 的人都能运行该 Tunnel。它不是 Cloudflare API Token，也不是 Turnstile Secret。
+
+### 3. 创建独立的 cloudflared Compose 项目
+
+推荐把 Tunnel 放在独立目录，不要把 Tunnel Token 写入 tg-watchbot 的 `.env`：
+
+```bash
+sudo install -d -m 700 -o "$USER" -g "$(id -gn)" /opt/tg-watchbot-cloudflared
+cd /opt/tg-watchbot-cloudflared
+umask 077
+nano cloudflared.env
+```
+
+在 `cloudflared.env` 中填写刚才复制的 Token：
+
+```dotenv
+TUNNEL_TOKEN=<粘贴 eyJ... 开头的 Tunnel Token>
+```
+
+保存后确认权限：
+
+```bash
+chmod 600 cloudflared.env
+```
+
+然后创建 `/opt/tg-watchbot-cloudflared/compose.yaml`：
+
+```yaml
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: tg-watchbot-cloudflared
+    restart: unless-stopped
+    network_mode: host
+    command: tunnel --no-autoupdate --loglevel info run
+    env_file:
+      - ./cloudflared.env
+```
+
+这里使用 `network_mode: host` 是为了让 cloudflared 容器中的 `127.0.0.1:8765` 指向 VPS 宿主机，与 tg-watchbot 默认的端口绑定直接兼容。此方案适用于 Linux VPS。
+
+Cloudflare 官方支持通过 `TUNNEL_TOKEN` 环境变量运行远程管理 Tunnel。Token 会存在容器配置中，因此只有受信任的管理员才能拥有 Docker 权限；不要把 `docker inspect`、未脱敏的诊断包或 `docker compose config` 输出公开。
+
+### 4. 启动 cloudflared 容器
+
+在 Tunnel 目录执行：
+
+```bash
+cd /opt/tg-watchbot-cloudflared
+docker compose config --quiet
+docker compose pull
+docker compose up -d
+docker compose ps
+docker compose logs --tail=100 cloudflared
+```
+
+正常情况下：
+
+- 容器状态为 `Up`；
+- 日志中出现已注册 Tunnel 连接的记录；
+- Cloudflare 控制台中的 Tunnel 状态在稍后变为 `Healthy`。
+
+如果 Tunnel 一直是 `Inactive`、`Down` 或 `Degraded`，先检查容器日志、Token 是否完整，以及 VPS 出站防火墙是否允许 cloudflared 连接 Cloudflare。受限网络还需要检查出站端口 `7844`。
+
+### 5. 添加 Published application 路由
+
+Tunnel 连接成功后，在 Cloudflare 控制台：
+
+1. 进入 `Networking → Tunnels`。
+2. 打开刚创建的 `tg-watchbot-vps`。
+3. 进入 `Routes`。
+4. 点击 `Add route`。
+5. 选择 `Published application`。
+6. 填写：
+
+| 项目 | 示例 |
+|---|---|
+| Subdomain | `bot-api` |
+| Domain | `example.com` |
+| Path | 留空；需要收窄暴露面时可只发布 `/api/verify/turnstile` |
+| Service type | `HTTP` |
+| Service URL | `http://127.0.0.1:8765` |
+
+7. 保存路由。
+
+Cloudflare 会为 Published application 创建对应的 Tunnel DNS 路由。若提示已有 A、AAAA 或 CNAME 记录，先检查 Cloudflare DNS；不要直接覆盖用途不明的现有记录。
+
+`Service URL` 能使用 `127.0.0.1` 是因为上面的 cloudflared 容器采用 host network。如果你自行改为普通 Docker 网络，应让 cloudflared 与 tg-watchbot 加入同一个网络，并改填：
+
+```text
+http://tg-watchbot:8765
+```
+
+普通 Docker 网络中不要填写 `http://127.0.0.1:8765`，因为它只会指向 cloudflared 容器自己。
+
+### 6. 验证 Tunnel
+
+若 Published application 未限制 Path，可以先检查登录页：
+
+```bash
+curl --fail --silent --show-error https://bot-api.example.com/login >/dev/null
+```
+
+再检查验证 API 是否能到达 tg-watchbot：
+
+```bash
+curl --silent --show-error --output /dev/null \
+  --write-out 'HTTP %{http_code}\n' \
+  --request POST \
+  https://bot-api.example.com/api/verify/turnstile
+```
+
+这里没有提供合法 Telegram `initData` 和 Turnstile token，因此不会返回验证成功。`400`、`401`、`409` 或尚未启用验证时的 `503` JSON 响应，都说明请求已经到达 tg-watchbot；以下结果则需要处理：
+
+| 结果 | 含义与检查方向 |
+|---|---|
+| `502` | cloudflared 无法连接 `127.0.0.1:8765`；检查 tg-watchbot 状态和 Docker 网络模式 |
+| `403` 或跳到 Access 登录页 | Cloudflare Access 拦截了 Worker 请求 |
+| Cloudflare Error `1033` | Tunnel 没有健康连接；检查 cloudflared 容器和 Token |
+| DNS 解析失败 | Published application 路由或域名 DNS 尚未生效 |
+
+确认后，在验证页面 Worker 中填写：
+
+```text
+TG_WATCHBOT_ORIGIN=https://bot-api.example.com
+```
+
+只填 HTTPS 根地址，不要附加 `/api/verify/turnstile`。
+
+### 7. Cloudflare Access 注意事项
+
+验证页面 Worker 会以服务端请求访问：
+
+```text
+https://bot-api.example.com/api/verify/turnstile
+```
+
+配套 Worker 当前不会执行浏览器式 Cloudflare Access 登录。因此：
+
+- 不要给整个 `bot-api.example.com` 套上要求邮箱登录或一次性验证码的 Access 策略；
+- 如果管理面板也使用 Tunnel，推荐另建 `admin.example.com`，并只给管理 hostname 配置 Access；
+- 如果必须复用同一个 hostname，应依据 [Cloudflare Access 路径规则](https://developers.cloudflare.com/cloudflare-one/access-controls/policies/app-paths/)确保 `/api/verify/turnstile` 不会被交互式登录拦截；
+- tg-watchbot 自身仍会对该接口执行 Telegram `initData` 验签、nonce 校验、时效检查和限流。
+
+推荐的 hostname 分工：
+
+```text
+admin.example.com    → Tunnel → tg-watchbot（使用 Access 保护管理页面）
+bot-api.example.com  → Tunnel → tg-watchbot（供验证页面 Worker 调用）
+verify.example.com   → 验证页面 Worker（Telegram Mini App）
+```
+
+### 8. 日常维护与 Token 安全
+
+更新 cloudflared：
+
+```bash
+cd /opt/tg-watchbot-cloudflared
+docker compose pull
+docker compose up -d
+```
+
+查看状态：
+
+```bash
+docker compose ps
+docker compose logs --tail=100 cloudflared
+```
+
+备份时不要把 `cloudflared.env` 放进 Git 或不加密的共享压缩包。Tunnel Token 泄露后，应立即在 Cloudflare Tunnel 的详情页执行 `Refresh token`，更新 `cloudflared.env`，然后重建容器：
+
+```bash
+docker compose up -d --force-recreate
+```
+
+Cloudflare 官方建议 Docker 环境使用远程管理 Tunnel；Docker 镜像使用 `--no-autoupdate` 时，应通过定期 `docker compose pull` 获取新版本。
+
 <a id="manual-install"></a>
 ## 手动安装（Python）
 
@@ -431,20 +666,7 @@ http://127.0.0.1:8765
 密码：change-me
 ```
 
-如果要从公网访问面板，推荐用 Cloudflare Tunnel + Zero Trust Access（需要域名），不需要开放服务器入站端口，也不用把 `WEB_PANEL_HOST` 改成 `0.0.0.0`。
-
-基本步骤：
-
-1. 在 Cloudflare Zero Trust 后台进入 `Networks` -> `Tunnels`，创建一个 Cloudflared Tunnel。
-2. 按页面提示在服务器安装并启动 `cloudflared`。
-3. 添加 Public Hostname，例如 `tg.example.com`。
-4. Service 填：
-
-```text
-http://127.0.0.1:8765
-```
-
-5. 在 Zero Trust 的 `Access` 里给这个域名加登录策略，例如只允许自己的邮箱访问。
+如果要从公网访问面板，推荐按照“[Cloudflare Tunnel（Docker 推荐）](#cloudflare-tunnel-docker)”章节部署独立 cloudflared 容器，不需要开放服务器入站端口，也不用把 `WEB_PANEL_HOST` 改成 `0.0.0.0`。管理入口可另外配置 Zero Trust Access，例如只允许自己的邮箱访问。
 
 如果还要启用配套的新用户验证，建议把管理入口和验证 API 入口分成两个 hostname：管理入口继续使用 Access，验证页面 Worker 使用的 Tunnel hostname（例如 `bot-api.example.com`）必须允许其访问 `/api/verify/turnstile`。如果复用一个被 Access 全站保护的 hostname，交互式登录页会拦截 Worker 请求并导致验证失败。
 
@@ -582,7 +804,7 @@ Siteverify Worker：https://tg-watchbot-siteverify.example.workers.dev
 
 ##### 1. 建立 Cloudflare Tunnel
 
-在 VPS 上运行 `cloudflared`，将一个 Tunnel 公网 hostname 指向 tg-watchbot：
+先按照“[Cloudflare Tunnel（Docker 推荐）](#cloudflare-tunnel-docker)”章节，从 Cloudflare 控制台创建 Tunnel、使用独立 Docker 容器启动 cloudflared，并添加 Published application。最终将一个 Tunnel 公网 hostname 指向 tg-watchbot：
 
 ```text
 https://bot-api.example.com
