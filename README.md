@@ -27,9 +27,13 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 项目为单文件应用，适合个人服务器、NAT 小鸡、轻量 VPS 直接用 systemd 跑。
 
 生产环境的新用户验证配套项目为
-[`u1ra/tg-watchbot-verify`](https://github.com/u1ra/tg-watchbot-verify)：
+[`u1ra/tg-watchbot-verify`](https://github.com/u1ra/tg-watchbot-verify)。
 它提供独立的验证页面 Worker 和 Siteverify Worker，并通过 Cloudflare Tunnel
-安全连接运行在 VPS 上的 tg-watchbot。
+安全连接运行在 VPS 上的 tg-watchbot。准备启用时请依次阅读：
+
+1. [Cloudflare Tunnel（Docker 推荐）部署教程](#cloudflare-tunnel-docker)：从控制台创建 Tunnel、保存 Token、启动 cloudflared 容器，到配置 Published application 和检查连通性。
+2. [新用户两阶段验证完整部署教程](#turnstile-production)：部署验证页面 Worker、Siteverify Worker，并填写 tg-watchbot WebUI。
+
 <a id="ai-one-line-install"></a>
 
 ## AI 辅助部署
