@@ -7,6 +7,7 @@
     <a href="#docker-install">Docker 安装</a> ·
     <a href="#manual-install">手动安装</a> ·
     <a href="#systemd-install">systemd 部署</a> ·
+    <a href="#turnstile-production">新用户验证部署</a> ·
     <a href="#面板路由">面板路由</a> ·
     <a href="#更新日志">更新日志</a>
   </p>
@@ -23,11 +24,16 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 自带一个 Web 管理面板，可配置监控目标、编辑 YAML、查看收件箱和日志。
 
 项目为单文件应用，适合个人服务器、NAT 小鸡、轻量 VPS 直接用 systemd 跑。
+
+生产环境的新用户验证配套项目为
+[`u1ra/tg-watchbot-verify`](https://github.com/u1ra/tg-watchbot-verify)：
+它提供独立的验证页面 Worker 和 Siteverify Worker，并通过 Cloudflare Tunnel
+安全连接运行在 VPS 上的 tg-watchbot。
 <a id="ai-one-line-install"></a>
 
 ## AI 辅助部署
 
-下面两段提示词可以直接复制给具有终端权限的 AI 编程助手。默认采用 Docker，保留现有数据，并把验证功能维持在安全的关闭状态，直到正式 HTTPS 域名和 Turnstile Worker 都准备完成。
+下面的提示词可以直接复制给具有终端权限的 AI 编程助手。默认采用 Docker，保留现有数据，并把验证功能维持在安全的关闭状态，直到正式域名、Cloudflare Tunnel、验证页面 Worker 和 Siteverify Worker 全部准备完成。
 
 ### 全新部署提示词
 
@@ -48,8 +54,8 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
    - touch tg-watchbot.sqlite3 tg-watchbot.log
    不得覆盖已有 .env、config.yaml 或 SQLite 数据库。
 5. 将 .env 权限设为 600。不要要求用户在聊天中粘贴 Telegram Bot Token、Turnstile secret、API key 或会话字符串，也不要在命令输出和最终报告中展示它们。
-6. 保持 docker-compose.yml 默认的 127.0.0.1:8765 端口绑定，不要把管理面板直接裸露到公网。公网访问应使用 SSH 隧道或带 HTTPS/鉴权的反向代理。
-7. 保持 BOT_VERIFICATION_ENABLED=false 和 TURNSTILE_TEST_MODE=false。除非用户明确要求并已提供最终 HTTPS 域名，否则不要创建 Cloudflare widget、不要部署 Worker、不要开启新用户验证。
+6. 保持 docker-compose.yml 默认的 127.0.0.1:8765 端口绑定，不要把管理面板直接裸露到公网。管理访问可使用 SSH 隧道或带 HTTPS/鉴权的反向代理；新用户验证的生产公网链路按 README 的“生产部署”章节使用配套仓库和 Cloudflare Tunnel。
+7. 保持 BOT_VERIFICATION_ENABLED=false 和 TURNSTILE_TEST_MODE=false。除非用户明确要求并确认 Cloudflare 资源范围，否则不要创建 Cloudflare Tunnel、Turnstile widget 或 Worker，也不要开启新用户验证。
 8. 依次运行并检查：
    - docker compose config
    - docker compose build
@@ -63,7 +69,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
     - 立即修改默认面板密码
     - 在“设置”中填写 TELEGRAM_BOT_TOKEN 和 ADMIN_CHAT_ID，保存后执行 docker compose restart
     - 普通监控的“排除关键词”可在新增/编辑页面直接配置
-    - Turnstile 参数可在“设置 → 新用户两阶段验证”配置，但生产 secret 只能保存在 Spin Worker
+    - Turnstile 参数可在“设置 → 新用户两阶段验证”配置，但生产 secret 只能保存在配套 Siteverify Worker
 11. 最终只汇报安装路径、容器状态、健康检查、面板访问方式、测试结果和仍需用户完成的项目；不要输出任何密钥内容。
 ```
 
@@ -106,7 +112,44 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - `.env` 权限为 `600`，数据库和配置文件没有被覆盖。
 - 默认面板密码已提醒修改，Token 等敏感值没有出现在聊天、日志摘要或 Git。
 - 全量测试通过；若不能通过，AI 必须明确报告，不能把部署描述为成功。
-- 新用户验证默认关闭。只有正式域名、sitekey、Spin Worker URL、hostname/action 全部确认后，才通过 WebUI 启用。
+- 新用户验证默认关闭。只有 Tunnel、验证页面 Worker、Siteverify Worker、sitekey、hostname/action 全部确认后，才通过 WebUI 启用。
+
+### 启用新用户验证的 AI 部署提示词
+
+下面这段用于已经成功运行 tg-watchbot、现在准备启用生产验证的实例：
+
+```text
+请为已经运行的 tg-watchbot 部署生产环境的新用户两阶段验证。
+
+主仓库：https://github.com/u1ra/tg-watchbot.git
+配套验证仓库：https://github.com/u1ra/tg-watchbot-verify
+
+执行要求：
+1. 先完整阅读两个仓库的 README、主项目 .env.example，以及配套仓库的 wrangler.jsonc、src/index.js、siteverify-worker/wrangler.jsonc 和 siteverify-worker/src/index.js；以代码中的实际变量名和路由为准。
+2. 检查 tg-watchbot 健康状态，确认 http://127.0.0.1:8765/health 正常。不得为了验证功能把 8765 端口直接开放到公网。
+3. 先向用户确认最终使用的三个地址：
+   - 验证页面 Worker 地址，例如 https://verify.example.com
+   - Tunnel 地址，例如 https://bot-api.example.com
+   - Siteverify Worker 地址，例如 https://tg-watchbot-siteverify.example.workers.dev
+   地址用途不得混用。
+4. 只有获得用户明确授权后才能创建或修改 Cloudflare 资源。为 VPS 创建 Cloudflare Tunnel，把 Tunnel 公网 hostname 转发到 http://127.0.0.1:8765；若 cloudflared 在 Docker 中，先处理容器网络，不能误用容器自己的 127.0.0.1。
+5. 创建 Turnstile Widget：模式使用 Managed，Pre-clearance 关闭，允许的 hostname 必须是“验证页面 Worker”的 hostname，不是 Tunnel 或 Siteverify Worker 的 hostname。
+6. 从配套仓库分别部署两个 Worker，少一个都不能启用：
+   - 验证页面 Worker：TG_WATCHBOT_ORIGIN=<Tunnel HTTPS 根地址>、TURNSTILE_SITE_KEY=<sitekey>、TURNSTILE_EXPECTED_ACTION=turnstile-spin-v1
+   - Siteverify Worker：TURNSTILE_SECRET_KEY=<Turnstile secret，必须保存为加密 Secret>、TURNSTILE_EXPECTED_HOSTNAME=<验证页面 Worker hostname>、TURNSTILE_EXPECTED_ACTION=turnstile-spin-v1
+7. 不要要求用户在聊天中粘贴 Turnstile secret、Cloudflare API Token、Tunnel Token 或 Bot Token；不要把任何 secret 写入主项目 .env、普通 Worker 变量、Git、命令参数或日志。
+8. 在 tg-watchbot WebUI 中填写：
+   - Mini App 公网根地址=<验证页面 Worker HTTPS 根地址，不加 /verify/telegram>
+   - Turnstile Site Key=<同一个 sitekey>
+   - Spin Siteverify Worker 地址=<Siteverify Worker HTTPS 根地址，不加 /health>
+   - 预期 Hostname=<验证页面 Worker hostname，不带协议和路径>
+   - 预期 Action=turnstile-spin-v1
+   - 本地测试模式=false
+   全部验证完成前保持“启用新用户验证”关闭。
+9. 检查 Siteverify Worker 的 /health 返回 ok；确认 Tunnel 能访问 tg-watchbot 的 /health，并确认验证页面 Worker 不返回 502/503。若 Tunnel hostname 使用 Cloudflare Access，必须保证 /api/verify/turnstile 不会被交互式登录拦截。
+10. 最后再启用新用户验证，使用一个从未私聊过 Bot 的 Telegram 账号完成 Turnstile、算数题和重新发送消息的端到端测试。旧用户不会触发首次验证，不能用来代替验收。
+11. 最终汇报三个非敏感 URL、hostname/action、Worker 健康状态、Tunnel 状态和端到端结果；不得输出 sitekey 以外的任何密钥内容。
+```
 
 ## 更新日志
 
@@ -115,8 +158,9 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 普通 Web/RSS 监控新增“排除关键词”WebUI，支持保存和编辑回显，命中排除词时优先跳过。
 - 新增可选的新用户 Turnstile + 算数题两阶段验证，老用户一次性免验证。
 - 新增 Telegram Mini App、服务端 `initData` 验签、nonce 防重放、过期、失败冷却与安全响应头。
-- “设置”和“用户管理”均可维护全部非敏感验证参数；生产 Turnstile secret 仍只保存在 Spin Worker。
+- “设置”和“用户管理”均可维护全部非敏感验证参数；生产 Turnstile secret 仍只保存在配套 Siteverify Worker。
 - 新用户验证默认关闭，生产 Cloudflare 资源与真实 Telegram 联调需在最终 HTTPS 域名确定后执行。
+- 补充配套项目 [`tg-watchbot-verify`](https://github.com/u1ra/tg-watchbot-verify) 的联合部署说明，明确 Cloudflare Tunnel、验证页面 Worker、Siteverify Worker 和 WebUI 字段之间的对应关系。
 
 ### 2026-06-02 更新
 
@@ -402,6 +446,8 @@ http://127.0.0.1:8765
 
 5. 在 Zero Trust 的 `Access` 里给这个域名加登录策略，例如只允许自己的邮箱访问。
 
+如果还要启用配套的新用户验证，建议把管理入口和验证 API 入口分成两个 hostname：管理入口继续使用 Access，验证页面 Worker 使用的 Tunnel hostname（例如 `bot-api.example.com`）必须允许其访问 `/api/verify/turnstile`。如果复用一个被 Access 全站保护的 hostname，交互式登录页会拦截 Worker 请求并导致验证失败。
+
 临时调试也可以用 SSH 端口转发：
 
 ```bash
@@ -449,16 +495,16 @@ curl http://127.0.0.1:8765/health
 | `TG_API_HASH` | （可选）Telegram API Hash，用于“TG 群监听=用户会话” |
 | `TG_API_SESSION` | （可选）Telethon StringSession，用于“TG 群监听=用户会话” |
 | `BOT_VERIFICATION_ENABLED` | 是否为新私聊用户启用两阶段验证；默认 `false` |
-| `BOT_VERIFICATION_PUBLIC_BASE_URL` | Mini App 的公网 HTTPS 根地址，不包含 `/verify/telegram` |
+| `BOT_VERIFICATION_PUBLIC_BASE_URL` | Mini App 的公网 HTTPS 根地址；配套部署时填写“验证页面 Worker”地址，不包含 `/verify/telegram` |
 | `BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS` | Telegram Mini App `initData` 最大有效期，默认 `300` 秒 |
 | `BOT_VERIFICATION_SESSION_TTL_SECONDS` | Turnstile 入口会话有效期，默认 `600` 秒 |
 | `BOT_VERIFICATION_MATH_TTL_SECONDS` | 算数题有效期，默认 `600` 秒 |
 | `BOT_VERIFICATION_MATH_MAX_ATTEMPTS` | 算数题最多答错次数，默认 `3` |
 | `BOT_VERIFICATION_COOLDOWN_SECONDS` | 达到错误上限后的冷却时间，默认 `600` 秒 |
 | `BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS` | 重复验证提示的最小间隔，默认 `15` 秒 |
-| `TURNSTILE_SITE_KEY` | Turnstile 前端 sitekey；不是 secret |
-| `TURNSTILE_VERIFY_ENDPOINT` | 生产环境的 Turnstile Spin Siteverify Worker HTTPS 地址 |
-| `TURNSTILE_EXPECTED_HOSTNAME` | Siteverify 响应中必须匹配的正式 hostname，不含协议 |
+| `TURNSTILE_SITE_KEY` | Turnstile 前端 sitekey；与验证页面 Worker 使用同一个值，不是 secret |
+| `TURNSTILE_VERIFY_ENDPOINT` | 配套 Siteverify Worker 的 HTTPS 根地址，不包含 `/health` |
+| `TURNSTILE_EXPECTED_HOSTNAME` | 验证页面 Worker 的正式 hostname，不含协议和路径；不是 Tunnel hostname |
 | `TURNSTILE_EXPECTED_ACTION` | Siteverify 响应中必须匹配的 action，默认 `turnstile-spin-v1` |
 | `TURNSTILE_TEST_MODE` | 是否使用 Cloudflare 官方测试 secret；只允许 loopback 地址，默认 `false` |
 
@@ -469,7 +515,7 @@ curl http://127.0.0.1:8765/health
 1. 从 Bot 发出的 Web App 按钮打开 Mini App，并通过 Cloudflare Turnstile。
 2. 返回 Telegram，直接回复算数题的数字答案。
 
-管理员可以在 Web 面板的“设置 → 新用户两阶段验证”中修改全部非敏感参数；“用户管理”里的共享配置卡片也提供同一组字段。页面会显示当前配置是否完整。可编辑项包括功能开关、Mini App 地址、sitekey、Spin Worker 地址、预期 hostname/action、各阶段有效期、答错次数、冷却和提示间隔；WebUI 不提供生产 Turnstile secret 输入框。
+管理员可以在 Web 面板的“设置 → 新用户两阶段验证”中修改全部非敏感参数；“用户管理”里的共享配置卡片也提供同一组字段。页面会显示当前配置是否完整。可编辑项包括功能开关、Mini App 地址、sitekey、Siteverify Worker 地址、预期 hostname/action、各阶段有效期、答错次数、冷却和提示间隔；WebUI 不提供生产 Turnstile secret 输入框。Secret 必须以 `TURNSTILE_SECRET_KEY` 的名称保存在配套 Siteverify Worker 的加密 Secret 中。
 
 首次验证前发送的消息不会保存或转发；成功后 Bot 会要求用户重新发送。算数题 10 分钟过期，最多答错 3 次，达到上限后冷却 10 分钟并重新从 Turnstile 开始。管理员不受门禁影响，被封禁用户仍优先执行封禁。升级时数据库中已经存在的用户只会在一次性迁移中标记为历史已验证；之后出现的新用户不会因重启而自动放行。
 
@@ -497,28 +543,203 @@ TURNSTILE_TEST_MODE=true
 
 测试模式只允许 `localhost`、`127.0.0.1` 或 `::1`，不会接受公网 hostname。Telegram Web App 按钮仍要求 HTTPS，而且浏览器直接打开时没有可信 Telegram `initData`，因此本机只能检查页面和自动化链路，不能冒充真实 Telegram 端到端通过。不要在连接真实用户的 Bot 上保留这组本地配置。
 
-#### 生产部署
+<a id="turnstile-production"></a>
 
-当前本地开发不会创建 Cloudflare widget 或部署 Worker。服务器部署时再执行以下步骤：
+#### 生产部署：与 `tg-watchbot-verify` 联合使用
 
-1. 为本项目准备一个公网 HTTPS 地址，并保持 `WEB_PANEL_ENABLED=true`。
-2. 创建正式 Turnstile widget，将允许的 hostname 设为最终域名。
-3. 部署 Turnstile Spin Siteverify Worker，把 widget secret 只存入 Worker secret。
-4. 在本项目 `.env` 填写正式 `TURNSTILE_SITE_KEY`、Worker URL、预期 hostname/action，确认 `TURNSTILE_TEST_MODE=false` 后再启用门禁。
+生产环境使用配套仓库
+[`u1ra/tg-watchbot-verify`](https://github.com/u1ra/tg-watchbot-verify)。
+该仓库包含两个必须分别部署的 Cloudflare Worker：
 
-生产配置示例：
+1. **验证页面 Worker**：向 Telegram 用户显示 Turnstile，并把验证表单转发给 tg-watchbot。
+2. **Siteverify Worker**：加密保存 Turnstile secret，调用 Cloudflare Siteverify，并校验 `hostname` 和 `action`。
+
+两个 Worker 作用不同，地址不能混用，少部署任意一个都无法完成生产验证。
+
+配套方案的完整请求链路如下：
+
+```text
+Telegram
+  → 验证页面 Worker（Mini App 页面）
+  → Cloudflare Tunnel
+  → VPS 上的 tg-watchbot:8765
+  → Siteverify Worker
+  → Cloudflare Turnstile Siteverify
+  → tg-watchbot 发送算数题
+```
+
+[Cloudflare Turnstile 本身可以独立用于未经过 Cloudflare 的网站](https://developers.cloudflare.com/turnstile/get-started/)，并非协议上强制要求 Tunnel；但本项目与配套仓库的标准生产方案使用 Tunnel 作为验证页面 Worker 到 VPS 的安全公网入口。下文均按这套方案配置，不应把 `8765` 直接开放到公网。
+
+下面统一使用三个不同的示例地址：
+
+```text
+验证页面 Worker：https://verify.example.com
+Cloudflare Tunnel：https://bot-api.example.com
+Siteverify Worker：https://tg-watchbot-siteverify.example.workers.dev
+```
+
+请替换成自己的真实地址，并始终区分三者用途。
+
+##### 1. 建立 Cloudflare Tunnel
+
+在 VPS 上运行 `cloudflared`，将一个 Tunnel 公网 hostname 指向 tg-watchbot：
+
+```text
+https://bot-api.example.com
+  → Cloudflare Tunnel
+  → http://127.0.0.1:8765
+```
+
+保持 `WEB_PANEL_ENABLED=true`，因为验证 API 与 Web 面板由同一个服务提供。继续保留 Docker Compose 默认的 `127.0.0.1:8765` 绑定，不要开放公网端口。若 `cloudflared` 也运行在 Docker 中，容器内的 `127.0.0.1` 指向 cloudflared 容器自己；应使用 host network、`host.docker.internal`，或者让 cloudflared 与 tg-watchbot 加入同一个 Docker 网络。
+
+Tunnel hostname 若受 Cloudflare Access 保护，必须确保 `/api/verify/turnstile` 不会被交互式登录拦截，否则验证页面 Worker 无法转发请求并会返回 `502`。需要保护其他页面时，可以依据 [Cloudflare Access 路径规则](https://developers.cloudflare.com/cloudflare-one/access-controls/policies/app-paths/)为这个精确路径配置更具体的公开策略；tg-watchbot 自身仍会验证 Telegram `initData`、nonce、时效与频率。
+
+验证页面 Worker 中的变量应填写 Tunnel 的 HTTPS **根地址**：
+
+```text
+TG_WATCHBOT_ORIGIN=https://bot-api.example.com
+```
+
+不要填写 VPS IP、`127.0.0.1`、`8765` 公网地址或 `/api/verify/turnstile` 路径。
+
+##### 2. 创建 Turnstile Widget
+
+在 Cloudflare Turnstile 控制台创建 Widget：
+
+- Widget Mode 选择 **Managed**；
+- Pre-clearance 保持关闭；
+- 允许的 hostname 填“验证页面 Worker”的最终 hostname，例如 `verify.example.com`；
+- 不要填写 Tunnel hostname 或 Siteverify Worker hostname。
+
+创建完成后会得到：
+
+| Cloudflare 字段 | 用途 |
+|---|---|
+| Site Key / 站点密钥 | 可以公开；填入验证页面 Worker 和 tg-watchbot WebUI |
+| Secret Key / 密钥 | 不可公开；只保存到 Siteverify Worker 的 `TURNSTILE_SECRET_KEY` 加密 Secret |
+
+##### 3. 部署验证页面 Worker
+
+[一键部署验证页面 Worker](https://deploy.workers.cloudflare.com/?url=https://github.com/u1ra/tg-watchbot-verify)
+
+部署时配置：
+
+| Worker 变量 | 填写内容 |
+|---|---|
+| `TG_WATCHBOT_ORIGIN` | Tunnel HTTPS 根地址，例如 `https://bot-api.example.com` |
+| `TURNSTILE_SITE_KEY` | Widget 的 Site Key / 站点密钥 |
+| `TURNSTILE_EXPECTED_ACTION` | `turnstile-spin-v1` |
+
+部署完成后得到“验证页面 Worker 地址”，例如：
+
+```text
+https://verify.example.com
+```
+
+这个地址才是 Telegram Mini App 的公网根地址。它不是 Tunnel 地址。
+
+##### 4. 部署 Siteverify Worker
+
+[一键部署 Siteverify Worker](https://deploy.workers.cloudflare.com/?url=https://github.com/u1ra/tg-watchbot-verify/tree/main/siteverify-worker)
+
+部署时配置：
+
+| Worker 变量 | 类型 | 填写内容 |
+|---|---|---|
+| `TURNSTILE_SECRET_KEY` | **Secret** | Widget 的 Secret Key / 密钥 |
+| `TURNSTILE_EXPECTED_HOSTNAME` | 普通变量 | 验证页面 Worker hostname，例如 `verify.example.com` |
+| `TURNSTILE_EXPECTED_ACTION` | 普通变量 | `turnstile-spin-v1` |
+
+Secret 必须按照 [Cloudflare Workers Secret 指引](https://developers.cloudflare.com/workers/configuration/secrets/)，在 Cloudflare Dashboard 的
+`Workers & Pages → Siteverify Worker → Settings → Variables and Secrets`
+中保存为加密的 **Secret**，不要写入主项目 `.env`、普通明文变量、源码、日志、聊天或 Git。
+Turnstile secret 不应写入本项目 `.env`、HTML、日志或 Git。
+
+部署完成后得到“Siteverify Worker 地址”，例如：
+
+```text
+https://tg-watchbot-siteverify.example.workers.dev
+```
+
+##### 5. 填写 tg-watchbot WebUI
+
+打开“设置 → 新用户两阶段验证”，按下表填写：
+
+| WebUI 字段 | 填写内容 |
+|---|---|
+| 启用新用户验证 | 所有检查完成后最后勾选 |
+| 本地测试模式 | 生产环境不要勾选 |
+| Mini App 公网根地址 | 验证页面 Worker 地址，例如 `https://verify.example.com` |
+| Turnstile Site Key | Widget 的 Site Key / 站点密钥 |
+| Spin Siteverify Worker 地址 | Siteverify Worker HTTPS 根地址 |
+| 预期 Hostname | 验证页面 Worker hostname，例如 `verify.example.com` |
+| 预期 Action | `turnstile-spin-v1` |
+| initData 有效期 | 建议保持 `300` 秒 |
+| Turnstile 会话有效期 | 建议保持 `600` 秒 |
+| 算数题有效期 | 建议保持 `600` 秒 |
+| 算数题最多答错次数 | 建议保持 `3` |
+| 失败冷却时间 | 建议保持 `600` 秒 |
+| 重复提示间隔 | 建议保持 `15` 秒 |
+
+对应的 `.env` 示例为：
 
 ```dotenv
 BOT_VERIFICATION_ENABLED=true
-BOT_VERIFICATION_PUBLIC_BASE_URL=https://bot.example.com
+BOT_VERIFICATION_PUBLIC_BASE_URL=https://verify.example.com
 TURNSTILE_SITE_KEY=<正式 sitekey>
-TURNSTILE_VERIFY_ENDPOINT=https://turnstile-siteverify-example.workers.dev
-TURNSTILE_EXPECTED_HOSTNAME=bot.example.com
+TURNSTILE_VERIFY_ENDPOINT=https://tg-watchbot-siteverify.example.workers.dev
+TURNSTILE_EXPECTED_HOSTNAME=verify.example.com
 TURNSTILE_EXPECTED_ACTION=turnstile-spin-v1
 TURNSTILE_TEST_MODE=false
 ```
 
-Turnstile secret 不应写入本项目 `.env`、HTML、日志或 Git；这里只保存 Spin Worker 地址。Cloudflare 要求所有 token 都经过[服务端 Siteverify](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/)，且 token 只有 5 分钟有效并只能使用一次。本项目的 `/verify/telegram` 和 `/api/verify/turnstile` 是精确放行的公共入口，管理面板其他路由仍要求登录。缺少必要配置、验证端超时或返回异常时会失败关闭，不会自动放行用户。
+注意：
+
+- `BOT_VERIFICATION_PUBLIC_BASE_URL` 后面不要添加 `/verify/telegram`；
+- `TURNSTILE_VERIFY_ENDPOINT` 后面不要添加 `/health`；
+- `TURNSTILE_EXPECTED_HOSTNAME` 填验证页面 Worker hostname，不是 Tunnel hostname；
+- WebUI 只填写 Site Key，不提供 Secret 输入框，这是有意的安全隔离；
+- `TG_WATCHBOT_ORIGIN` 只存在于验证页面 Worker，不填写到 tg-watchbot WebUI。
+
+##### 6. 验收与故障排查
+
+先检查 Siteverify Worker：
+
+```text
+https://你的-siteverify-worker地址/health
+```
+
+正常应返回类似：
+
+```json
+{"ok":true,"service":"tg-watchbot-siteverify","version":"1.0.0"}
+```
+
+直接用浏览器打开 Siteverify Worker 根地址返回 `405` 是正常现象，因为根地址只接受 POST。最后必须使用一个**从未私聊过该 Bot 的 Telegram 账号**进行真实验收：
+
+1. 首次私聊后出现验证按钮；
+2. 验证页面 Worker 能显示 Turnstile；
+3. 完成人机验证后 Bot 发出算数题；
+4. 回答正确后要求重新发送原消息；
+5. 重新发送的消息能够正常进入原有处理流程。
+
+数据库中已经存在的旧用户会被标记为历史已验证，不能用来测试“首次私聊”门禁。
+
+常见错误：
+
+| 现象 | 优先检查 |
+|---|---|
+| 验证页面返回 `502` | `TG_WATCHBOT_ORIGIN`、Tunnel 状态、Access 策略、VPS/容器网络 |
+| 验证页面返回 `503` | 验证页面 Worker 的 sitekey、action、Tunnel 根地址 |
+| Turnstile 不显示或域名错误 | Widget 允许的 hostname 是否为验证页面 Worker hostname |
+| Turnstile 完成后没有算数题 | Siteverify Worker secret、预期 hostname/action、tg-watchbot 日志 |
+| Siteverify `/health` 正常但验证失败 | 是否把 Siteverify 根地址误填成 `/health`，或混用了两个 Worker 地址 |
+
+Cloudflare 要求所有 token 都经过[服务端 Siteverify](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/)，且 token 只有 5 分钟有效并只能使用一次。本项目的 `/api/verify/turnstile` 是验证页面 Worker 经 Tunnel 调用的精确公共入口；管理面板其他路由仍要求登录。缺少必要配置、验证端超时或返回异常时会失败关闭，不会自动放行用户。
+
+配套 Worker 的变量、部署按钮和最新故障排查以
+[`tg-watchbot-verify` README](https://github.com/u1ra/tg-watchbot-verify#readme)
+为准。
 
 ### `config.yaml`
 
