@@ -88,6 +88,7 @@ VERIFICATION_ENV_DEFAULTS = {
     "BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS": "15",
     "TURNSTILE_SITE_KEY": "",
     "TURNSTILE_VERIFY_ENDPOINT": "",
+    "TURNSTILE_VERIFY_AUTH_TOKEN": "",
     "TURNSTILE_EXPECTED_HOSTNAME": "",
     "TURNSTILE_EXPECTED_ACTION": "turnstile-spin-v1",
     "TURNSTILE_TEST_MODE": "false",
@@ -812,6 +813,10 @@ def verification_settings() -> dict[str, Any]:
         ),
         "turnstile_site_key": os.getenv("TURNSTILE_SITE_KEY", "").strip(),
         "turnstile_verify_endpoint": os.getenv("TURNSTILE_VERIFY_ENDPOINT", "").strip(),
+        "turnstile_verify_auth_token": os.getenv(
+            "TURNSTILE_VERIFY_AUTH_TOKEN",
+            "",
+        ).strip(),
         "turnstile_expected_hostname": os.getenv("TURNSTILE_EXPECTED_HOSTNAME", "").strip(),
         "turnstile_expected_action": os.getenv(
             "TURNSTILE_EXPECTED_ACTION",
@@ -923,11 +928,16 @@ async def verify_turnstile_token(
             "token": token,
             "cf-turnstile-response": token,
         }
+    headers = {}
+    if not values.get("turnstile_test_mode"):
+        auth_token = str(values.get("turnstile_verify_auth_token") or "").strip()
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
     if remote_ip:
         payload["remoteip"] = remote_ip
     try:
         async with httpx.AsyncClient(timeout=8) as client:
-            response = await client.post(endpoint, data=payload)
+            response = await client.post(endpoint, data=payload, headers=headers)
             response.raise_for_status()
             result = response.json()
     except Exception as exc:
@@ -3707,6 +3717,11 @@ def normalize_verification_form_values(values: dict[str, Any]) -> dict[str, Any]
         if values.get("TURNSTILE_VERIFY_ENDPOINT") is not None
         else current.get("TURNSTILE_VERIFY_ENDPOINT", "")
     ).strip()
+    normalized["TURNSTILE_VERIFY_AUTH_TOKEN"] = str(
+        values.get("TURNSTILE_VERIFY_AUTH_TOKEN")
+        if values.get("TURNSTILE_VERIFY_AUTH_TOKEN") is not None
+        else current.get("TURNSTILE_VERIFY_AUTH_TOKEN", "")
+    ).strip()
     normalized["TURNSTILE_EXPECTED_HOSTNAME"] = str(
         values.get("TURNSTILE_EXPECTED_HOSTNAME")
         if values.get("TURNSTILE_EXPECTED_HOSTNAME") is not None
@@ -3764,6 +3779,7 @@ def verification_settings_form_html(values: dict[str, str], step_no: str = "3") 
 <div class=grid><div><label>Mini App 公网根地址</label><input name=BOT_VERIFICATION_PUBLIC_BASE_URL value='{attr("BOT_VERIFICATION_PUBLIC_BASE_URL")}' placeholder='https://bot.example.com'></div>
 <div><label>Turnstile Site Key</label><input name=TURNSTILE_SITE_KEY value='{attr("TURNSTILE_SITE_KEY")}' placeholder='0x4AAAA...'></div>
 <div><label>Spin Siteverify Worker 地址</label><input name=TURNSTILE_VERIFY_ENDPOINT value='{attr("TURNSTILE_VERIFY_ENDPOINT")}' placeholder='https://turnstile-siteverify-example.workers.dev'></div>
+<div><label>Siteverify 鉴权 Token（推荐）</label><input name=TURNSTILE_VERIFY_AUTH_TOKEN type=password autocomplete=new-password value='{attr("TURNSTILE_VERIFY_AUTH_TOKEN")}' placeholder='与 Worker 的 SITEVERIFY_AUTH_TOKEN 相同'></div>
 <div><label>预期 Hostname</label><input name=TURNSTILE_EXPECTED_HOSTNAME value='{attr("TURNSTILE_EXPECTED_HOSTNAME")}' placeholder='bot.example.com'></div>
 <div><label>预期 Action</label><input name=TURNSTILE_EXPECTED_ACTION value='{attr("TURNSTILE_EXPECTED_ACTION", "turnstile-spin-v1")}'></div>
 <div><label>initData 有效期（秒）</label><input name=BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS type=number min=1 value='{attr("BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS", "300")}'></div>
@@ -4823,6 +4839,7 @@ async function logoutTgSession() {{
         BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS: str | None = Form(None),
         TURNSTILE_SITE_KEY: str | None = Form(None),
         TURNSTILE_VERIFY_ENDPOINT: str | None = Form(None),
+        TURNSTILE_VERIFY_AUTH_TOKEN: str | None = Form(None),
         TURNSTILE_EXPECTED_HOSTNAME: str | None = Form(None),
         TURNSTILE_EXPECTED_ACTION: str | None = Form(None),
         TURNSTILE_TEST_MODE: str | None = Form(None),
@@ -4987,6 +5004,7 @@ async function logoutTgSession() {{
         BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS: str | None = Form(None),
         TURNSTILE_SITE_KEY: str | None = Form(None),
         TURNSTILE_VERIFY_ENDPOINT: str | None = Form(None),
+        TURNSTILE_VERIFY_AUTH_TOKEN: str | None = Form(None),
         TURNSTILE_EXPECTED_HOSTNAME: str | None = Form(None),
         TURNSTILE_EXPECTED_ACTION: str | None = Form(None),
         TURNSTILE_TEST_MODE: str | None = Form(None),

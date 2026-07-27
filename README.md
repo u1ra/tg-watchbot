@@ -730,6 +730,7 @@ curl http://127.0.0.1:8765/health
 | `BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS` | 重复验证提示的最小间隔，默认 `15` 秒 |
 | `TURNSTILE_SITE_KEY` | Turnstile 前端 sitekey；与验证页面 Worker 使用同一个值，不是 secret |
 | `TURNSTILE_VERIFY_ENDPOINT` | 配套 Siteverify Worker 的 HTTPS 根地址，不包含 `/health` |
+| `TURNSTILE_VERIFY_AUTH_TOKEN` | 可选但强烈建议；调用 Siteverify Worker 的共享鉴权 Token，必须与 Worker 的 `SITEVERIFY_AUTH_TOKEN` 完全相同 |
 | `TURNSTILE_EXPECTED_HOSTNAME` | 验证页面 Worker 的正式 hostname，不含协议和路径；不是 Tunnel hostname |
 | `TURNSTILE_EXPECTED_ACTION` | Siteverify 响应中必须匹配的 action，默认 `turnstile-spin-v1` |
 | `TURNSTILE_TEST_MODE` | 是否使用 Cloudflare 官方测试 secret；只允许 loopback 地址，默认 `false` |
@@ -741,7 +742,7 @@ curl http://127.0.0.1:8765/health
 1. 从 Bot 发出的 Web App 按钮打开 Mini App，并通过 Cloudflare Turnstile。
 2. 返回 Telegram，直接回复算数题的数字答案。
 
-管理员可以在 Web 面板的“设置 → 新用户两阶段验证”中修改全部非敏感参数；“用户管理”里的共享配置卡片也提供同一组字段。页面会显示当前配置是否完整。可编辑项包括功能开关、Mini App 地址、sitekey、Siteverify Worker 地址、预期 hostname/action、各阶段有效期、答错次数、冷却和提示间隔；WebUI 不提供生产 Turnstile secret 输入框。Secret 必须以 `TURNSTILE_SECRET_KEY` 的名称保存在配套 Siteverify Worker 的加密 Secret 中。
+管理员可以在 Web 面板的“设置 → 新用户两阶段验证”中修改验证参数；“用户管理”里的共享配置卡片也提供同一组字段。页面会显示当前配置是否完整。可编辑项包括功能开关、Mini App 地址、sitekey、Siteverify Worker 地址、Siteverify 鉴权 Token、预期 hostname/action、各阶段有效期、答错次数、冷却和提示间隔。鉴权 Token 使用密码输入框并只保存在服务端 `.env`；WebUI 不提供生产 Turnstile secret 输入框。Turnstile secret 必须以 `TURNSTILE_SECRET_KEY` 的名称保存在配套 Siteverify Worker 的加密 Secret 中。
 
 首次验证前发送的消息不会保存或转发；成功后 Bot 会要求用户重新发送。算数题 10 分钟过期，最多答错 3 次，达到上限后冷却 10 分钟并重新从 Turnstile 开始。管理员不受门禁影响，被封禁用户仍优先执行封禁。升级时数据库中已经存在的用户只会在一次性迁移中标记为历史已验证；之后出现的新用户不会因重启而自动放行。
 
@@ -789,7 +790,7 @@ Telegram
   → 验证页面 Worker（Mini App 页面）
   → Cloudflare Tunnel
   → VPS 上的 tg-watchbot:8765
-  → Siteverify Worker
+  → Siteverify Worker（Bearer Token 鉴权）
   → Cloudflare Turnstile Siteverify
   → tg-watchbot 发送算数题
 ```
@@ -873,13 +874,19 @@ https://verify.example.com
 | Worker 变量 | 类型 | 填写内容 |
 |---|---|---|
 | `TURNSTILE_SECRET_KEY` | **Secret** | Widget 的 Secret Key / 密钥 |
+| `SITEVERIFY_AUTH_TOKEN` | **Secret** | 自行生成的随机鉴权 Token；必须与 tg-watchbot 的 `TURNSTILE_VERIFY_AUTH_TOKEN` 完全相同 |
 | `TURNSTILE_EXPECTED_HOSTNAME` | 普通变量 | 验证页面 Worker hostname，例如 `verify.example.com` |
 | `TURNSTILE_EXPECTED_ACTION` | 普通变量 | `turnstile-spin-v1` |
 
-Secret 必须按照 [Cloudflare Workers Secret 指引](https://developers.cloudflare.com/workers/configuration/secrets/)，在 Cloudflare Dashboard 的
+可以先生成一个 32 字节随机鉴权 Token：
+
+```bash
+openssl rand -hex 32
+```
+
+`TURNSTILE_SECRET_KEY` 和 `SITEVERIFY_AUTH_TOKEN` 都必须按照 [Cloudflare Workers Secret 指引](https://developers.cloudflare.com/workers/configuration/secrets/)，在 Cloudflare Dashboard 的
 `Workers & Pages → Siteverify Worker → Settings → Variables and Secrets`
-中保存为加密的 **Secret**，不要写入主项目 `.env`、普通明文变量、源码、日志、聊天或 Git。
-Turnstile secret 不应写入本项目 `.env`、HTML、日志或 Git。
+中保存为加密的 **Secret**，不要保存为普通明文变量。Turnstile secret 不应写入本项目 `.env`、HTML、日志或 Git；Siteverify 鉴权 Token 则需要以另一个变量名 `TURNSTILE_VERIFY_AUTH_TOKEN` 保存到本项目服务端 `.env`，但同样不能进入 HTML、日志、聊天或 Git。
 
 部署完成后得到“Siteverify Worker 地址”，例如：
 
@@ -898,6 +905,7 @@ https://tg-watchbot-siteverify.example.workers.dev
 | Mini App 公网根地址 | 验证页面 Worker 地址，例如 `https://verify.example.com` |
 | Turnstile Site Key | Widget 的 Site Key / 站点密钥 |
 | Spin Siteverify Worker 地址 | Siteverify Worker HTTPS 根地址 |
+| Siteverify 鉴权 Token | 与 Worker 的 `SITEVERIFY_AUTH_TOKEN` 完全相同的随机值 |
 | 预期 Hostname | 验证页面 Worker hostname，例如 `verify.example.com` |
 | 预期 Action | `turnstile-spin-v1` |
 | initData 有效期 | 建议保持 `300` 秒 |
@@ -914,6 +922,7 @@ BOT_VERIFICATION_ENABLED=true
 BOT_VERIFICATION_PUBLIC_BASE_URL=https://verify.example.com
 TURNSTILE_SITE_KEY=<正式 sitekey>
 TURNSTILE_VERIFY_ENDPOINT=https://tg-watchbot-siteverify.example.workers.dev
+TURNSTILE_VERIFY_AUTH_TOKEN=<与 Worker 的 SITEVERIFY_AUTH_TOKEN 相同>
 TURNSTILE_EXPECTED_HOSTNAME=verify.example.com
 TURNSTILE_EXPECTED_ACTION=turnstile-spin-v1
 TURNSTILE_TEST_MODE=false
@@ -923,8 +932,9 @@ TURNSTILE_TEST_MODE=false
 
 - `BOT_VERIFICATION_PUBLIC_BASE_URL` 后面不要添加 `/verify/telegram`；
 - `TURNSTILE_VERIFY_ENDPOINT` 后面不要添加 `/health`；
+- Worker 配置了 `SITEVERIFY_AUTH_TOKEN` 后，这里必须填写完全相同的 `TURNSTILE_VERIFY_AUTH_TOKEN`，否则验证会失败；
 - `TURNSTILE_EXPECTED_HOSTNAME` 填验证页面 Worker hostname，不是 Tunnel hostname；
-- WebUI 只填写 Site Key，不提供 Secret 输入框，这是有意的安全隔离；
+- WebUI 提供 Site Key 和 Siteverify 鉴权 Token，但不提供 Turnstile Secret 输入框，这是有意的安全隔离；
 - `TG_WATCHBOT_ORIGIN` 只存在于验证页面 Worker，不填写到 tg-watchbot WebUI。
 
 ##### 6. 验收与故障排查
@@ -960,6 +970,7 @@ https://你的-siteverify-worker地址/health
 | Turnstile 不显示或域名错误 | Widget 允许的 hostname 是否为验证页面 Worker hostname |
 | Turnstile 完成后没有算数题 | Siteverify Worker secret、预期 hostname/action、tg-watchbot 日志 |
 | Siteverify `/health` 正常但验证失败 | 是否把 Siteverify 根地址误填成 `/health`，或混用了两个 Worker 地址 |
+| Siteverify 返回 `401` 或配置后突然全部失败 | Worker 的 `SITEVERIFY_AUTH_TOKEN` 与本项目的 `TURNSTILE_VERIFY_AUTH_TOKEN` 是否完全相同 |
 
 Cloudflare 要求所有 token 都经过[服务端 Siteverify](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/)，且 token 只有 5 分钟有效并只能使用一次。本项目的 `/api/verify/turnstile` 是验证页面 Worker 经 Tunnel 调用的精确公共入口；管理面板其他路由仍要求登录。缺少必要配置、验证端超时或返回异常时会失败关闭，不会自动放行用户。
 

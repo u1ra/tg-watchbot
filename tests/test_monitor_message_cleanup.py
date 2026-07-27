@@ -441,6 +441,7 @@ class PrivateVerificationGateTest(unittest.TestCase):
         "BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS",
         "TURNSTILE_SITE_KEY",
         "TURNSTILE_VERIFY_ENDPOINT",
+        "TURNSTILE_VERIFY_AUTH_TOKEN",
         "TURNSTILE_EXPECTED_HOSTNAME",
         "TURNSTILE_EXPECTED_ACTION",
         "TURNSTILE_TEST_MODE",
@@ -464,6 +465,7 @@ class PrivateVerificationGateTest(unittest.TestCase):
         os.environ["BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS"] = "15"
         os.environ["TURNSTILE_SITE_KEY"] = "test-site-key"
         os.environ["TURNSTILE_VERIFY_ENDPOINT"] = "https://worker.example.test"
+        os.environ["TURNSTILE_VERIFY_AUTH_TOKEN"] = "shared-siteverify-token"
         os.environ["TURNSTILE_EXPECTED_HOSTNAME"] = "verify.example.test"
         os.environ["TURNSTILE_EXPECTED_ACTION"] = "turnstile-spin-v1"
         os.environ["TURNSTILE_TEST_MODE"] = "false"
@@ -585,6 +587,7 @@ class TurnstileVerificationTest(unittest.TestCase):
         "BOT_VERIFICATION_MATH_MAX_ATTEMPTS",
         "TURNSTILE_SITE_KEY",
         "TURNSTILE_VERIFY_ENDPOINT",
+        "TURNSTILE_VERIFY_AUTH_TOKEN",
         "TURNSTILE_EXPECTED_HOSTNAME",
         "TURNSTILE_EXPECTED_ACTION",
         "TURNSTILE_TEST_MODE",
@@ -608,6 +611,7 @@ class TurnstileVerificationTest(unittest.TestCase):
                 "BOT_VERIFICATION_MATH_MAX_ATTEMPTS": "3",
                 "TURNSTILE_SITE_KEY": "test-site-key",
                 "TURNSTILE_VERIFY_ENDPOINT": "https://worker.example.test",
+                "TURNSTILE_VERIFY_AUTH_TOKEN": "shared-siteverify-token",
                 "TURNSTILE_EXPECTED_HOSTNAME": "verify.example.test",
                 "TURNSTILE_EXPECTED_ACTION": "turnstile-spin-v1",
                 "TURNSTILE_TEST_MODE": "false",
@@ -910,6 +914,80 @@ class TurnstileVerificationTest(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(["verification-request-failed"], result["error-codes"])
 
+    def test_siteverify_bearer_auth_is_sent_only_to_configured_worker(self) -> None:
+        old_client = getattr(app.httpx, "AsyncClient", None)
+        calls = []
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "success": True,
+                    "hostname": "verify.example.test",
+                    "action": "turnstile-spin-v1",
+                }
+
+        class CapturingClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+            async def post(self, endpoint, **kwargs):
+                calls.append((endpoint, kwargs))
+                return FakeResponse()
+
+        app.httpx.AsyncClient = CapturingClient
+        try:
+            production = app.verification_settings()
+            protected_result = asyncio.run(
+                app.verify_turnstile_token(
+                    "protected-token",
+                    settings=production,
+                )
+            )
+            compatible_result = asyncio.run(
+                app.verify_turnstile_token(
+                    "compatible-token",
+                    settings=dict(
+                        production,
+                        turnstile_verify_auth_token="",
+                    ),
+                )
+            )
+            test_result = asyncio.run(
+                app.verify_turnstile_token(
+                    "test-mode-token",
+                    settings=dict(
+                        production,
+                        public_base_url="http://127.0.0.1:8765",
+                        turnstile_test_mode=True,
+                    ),
+                )
+            )
+        finally:
+            if old_client is None:
+                delattr(app.httpx, "AsyncClient")
+            else:
+                app.httpx.AsyncClient = old_client
+
+        self.assertTrue(protected_result["success"])
+        self.assertTrue(compatible_result["success"])
+        self.assertTrue(test_result["success"])
+        self.assertEqual(
+            {"Authorization": "Bearer shared-siteverify-token"},
+            calls[0][1]["headers"],
+        )
+        self.assertEqual({}, calls[1][1]["headers"])
+        self.assertEqual(app.TURNSTILE_SITEVERIFY_URL, calls[2][0])
+        self.assertEqual({}, calls[2][1]["headers"])
+
     def test_public_routes_are_exact_and_security_headers_are_strict(self) -> None:
         self.assertTrue(app.panel_path_is_public("/verify/telegram"))
         self.assertTrue(app.panel_path_is_public("/api/verify/turnstile"))
@@ -1008,7 +1086,7 @@ class TurnstileVerificationTest(unittest.TestCase):
 
 
 class BotConfigurationTest(unittest.TestCase):
-    def test_env_example_documents_verification_without_a_secret(self) -> None:
+    def test_env_example_documents_verification_without_turnstile_secret(self) -> None:
         env_example = Path(".env.example").read_text(encoding="utf-8")
         for key in [
             "BOT_VERIFICATION_ENABLED=false",
@@ -1017,6 +1095,7 @@ class BotConfigurationTest(unittest.TestCase):
             "BOT_VERIFICATION_MATH_MAX_ATTEMPTS=3",
             "TURNSTILE_SITE_KEY=",
             "TURNSTILE_VERIFY_ENDPOINT=",
+            "TURNSTILE_VERIFY_AUTH_TOKEN=",
             "TURNSTILE_EXPECTED_HOSTNAME=",
             "TURNSTILE_EXPECTED_ACTION=turnstile-spin-v1",
             "TURNSTILE_TEST_MODE=false",
@@ -1031,6 +1110,8 @@ class BotConfigurationTest(unittest.TestCase):
         self.assertIn("生产部署", readme)
         self.assertIn("1x00000000000000000000AA", readme)
         self.assertIn("secret 不应写入本项目", readme)
+        self.assertIn("SITEVERIFY_AUTH_TOKEN", readme)
+        self.assertIn("TURNSTILE_VERIFY_AUTH_TOKEN", readme)
 
     def test_readme_ai_deployment_prompts_use_current_repo_and_safe_defaults(self) -> None:
         readme = Path("README.md").read_text(encoding="utf-8")
@@ -1112,6 +1193,7 @@ class BotConfigurationTest(unittest.TestCase):
             app.ENV_PATH.write_text(
                 "BOT_VERIFICATION_ENABLED=true\n"
                 "TURNSTILE_SITE_KEY=existing-site-key\n"
+                "TURNSTILE_VERIFY_AUTH_TOKEN=existing-auth-token\n"
                 "CUSTOM_DEPLOYMENT_VALUE=keep-me\n",
                 encoding="utf-8",
             )
@@ -1122,6 +1204,7 @@ class BotConfigurationTest(unittest.TestCase):
                 app.ENV_PATH = old_env_path
         self.assertIn("BOT_VERIFICATION_ENABLED=true", saved)
         self.assertIn("TURNSTILE_SITE_KEY=existing-site-key", saved)
+        self.assertIn("TURNSTILE_VERIFY_AUTH_TOKEN=existing-auth-token", saved)
         self.assertIn("CUSTOM_DEPLOYMENT_VALUE=keep-me", saved)
 
     def test_verification_form_normalizes_booleans_numbers_and_hostname(self) -> None:
@@ -1138,6 +1221,7 @@ class BotConfigurationTest(unittest.TestCase):
                 "BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS": "20",
                 "TURNSTILE_SITE_KEY": " site-key ",
                 "TURNSTILE_VERIFY_ENDPOINT": " https://worker.example.test ",
+                "TURNSTILE_VERIFY_AUTH_TOKEN": " shared-siteverify-token ",
                 "TURNSTILE_EXPECTED_HOSTNAME": "Bot.Example.COM.",
                 "TURNSTILE_EXPECTED_ACTION": "",
             }
@@ -1147,10 +1231,14 @@ class BotConfigurationTest(unittest.TestCase):
         self.assertEqual("https://bot.example.com", normalized["BOT_VERIFICATION_PUBLIC_BASE_URL"])
         self.assertEqual("1", normalized["BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS"])
         self.assertEqual("600", normalized["BOT_VERIFICATION_SESSION_TTL_SECONDS"])
+        self.assertEqual(
+            "shared-siteverify-token",
+            normalized["TURNSTILE_VERIFY_AUTH_TOKEN"],
+        )
         self.assertEqual("bot.example.com", normalized["TURNSTILE_EXPECTED_HOSTNAME"])
         self.assertEqual("turnstile-spin-v1", normalized["TURNSTILE_EXPECTED_ACTION"])
 
-    def test_verification_admin_form_exposes_all_non_secret_parameters(self) -> None:
+    def test_verification_admin_form_exposes_config_without_turnstile_secret(self) -> None:
         values = dict(app.VERIFICATION_ENV_DEFAULTS)
         values.update(
             {
@@ -1159,6 +1247,7 @@ class BotConfigurationTest(unittest.TestCase):
                 "BOT_VERIFICATION_PUBLIC_BASE_URL": "https://bot.example.com",
                 "TURNSTILE_SITE_KEY": "site-key",
                 "TURNSTILE_VERIFY_ENDPOINT": "https://worker.example.test",
+                "TURNSTILE_VERIFY_AUTH_TOKEN": "shared-siteverify-token",
                 "TURNSTILE_EXPECTED_HOSTNAME": "bot.example.com",
             }
         )
@@ -1166,6 +1255,7 @@ class BotConfigurationTest(unittest.TestCase):
         for key in app.VERIFICATION_ENV_DEFAULTS:
             self.assertIn(f"name={key}", form)
         self.assertIn("必要参数完整", form)
+        self.assertIn("name=TURNSTILE_VERIFY_AUTH_TOKEN type=password", form)
         self.assertNotIn("name=TURNSTILE_SECRET", form)
 
     def test_both_admin_settings_routes_accept_verification_fields(self) -> None:
