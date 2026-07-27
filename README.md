@@ -3,7 +3,7 @@
   <p>Telegram 双向客服机器人 + Web/RSS 监控推送 + 群组/频道关键词监听 + 可视化管理面板</p>
   <p>双向对话 · 关键词监控 · 群组/频道监听 · 私聊广告拦截 · 多管理员 · 配置导入导出</p>
   <p>
-    <a href="#ai-one-line-install">AI 一句话安装</a> ·
+    <a href="#ai-one-line-install">AI 辅助部署</a> ·
     <a href="#docker-install">Docker 安装</a> ·
     <a href="#manual-install">手动安装</a> ·
     <a href="#systemd-install">systemd 部署</a> ·
@@ -25,11 +25,98 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 项目为单文件应用，适合个人服务器、NAT 小鸡、轻量 VPS 直接用 systemd 跑。
 <a id="ai-one-line-install"></a>
 
-## AI 一句话安装
+## AI 辅助部署
+
+下面两段提示词可以直接复制给具有终端权限的 AI 编程助手。默认采用 Docker，保留现有数据，并把验证功能维持在安全的关闭状态，直到正式 HTTPS 域名和 Turnstile Worker 都准备完成。
+
+### 全新部署提示词
+
+```text
+请作为服务器部署代理，完整部署 tg-watchbot：
+
+仓库：https://github.com/u1ra/tg-watchbot.git
+默认目录：/opt/tg-watchbot
+首选方式：Docker Compose
+
+执行要求：
+1. 先检查操作系统、CPU 架构、Docker、Docker Compose、Git 和 8765 端口占用；报告异常后再处理，不要静默覆盖已有服务。
+2. 如果目标目录已经存在或已经有 tg-watchbot 数据，停止全新安装，改用 README 的“已有实例升级提示词”。
+3. 克隆仓库后完整阅读 README.md、DEVELOPMENT_PLAN.md、.env.example 和 docker-compose.yml。
+4. 仅在文件不存在时执行：
+   - cp .env.example .env
+   - cp config.example.yaml config.yaml
+   - touch tg-watchbot.sqlite3 tg-watchbot.log
+   不得覆盖已有 .env、config.yaml 或 SQLite 数据库。
+5. 将 .env 权限设为 600。不要要求用户在聊天中粘贴 Telegram Bot Token、Turnstile secret、API key 或会话字符串，也不要在命令输出和最终报告中展示它们。
+6. 保持 docker-compose.yml 默认的 127.0.0.1:8765 端口绑定，不要把管理面板直接裸露到公网。公网访问应使用 SSH 隧道或带 HTTPS/鉴权的反向代理。
+7. 保持 BOT_VERIFICATION_ENABLED=false 和 TURNSTILE_TEST_MODE=false。除非用户明确要求并已提供最终 HTTPS 域名，否则不要创建 Cloudflare widget、不要部署 Worker、不要开启新用户验证。
+8. 依次运行并检查：
+   - docker compose config
+   - docker compose build
+   - docker compose run --rm --no-deps tg-watchbot python -m unittest discover -s tests -v
+   - docker compose up -d
+   - docker compose ps
+   - curl --fail http://127.0.0.1:8765/health
+9. 启动失败时查看 docker compose logs --tail=200，但必须过滤 Token、secret、initData、session 等敏感值；不要通过删除数据库或覆盖配置来“修复”。
+10. 部署成功后告诉用户：
+    - 如何通过 SSH 隧道访问 http://127.0.0.1:8765
+    - 立即修改默认面板密码
+    - 在“设置”中填写 TELEGRAM_BOT_TOKEN 和 ADMIN_CHAT_ID，保存后执行 docker compose restart
+    - 普通监控的“排除关键词”可在新增/编辑页面直接配置
+    - Turnstile 参数可在“设置 → 新用户两阶段验证”配置，但生产 secret 只能保存在 Spin Worker
+11. 最终只汇报安装路径、容器状态、健康检查、面板访问方式、测试结果和仍需用户完成的项目；不要输出任何密钥内容。
 ```
-请克隆 `https://github.com/GongyiChuren/tg-watchbot.git` 到本机，默认使用 Docker 按 README 的 `Docker 安装（含自启）` 启动服务；若无 Docker，则按 `快速开始` 走 Python 和 systemd 部署直接安装。启动后打开 `http://127.0.0.1:8765`，安装完成后提醒用户记得在面板填写 `TELEGRAM_BOT_TOKEN` 和 `ADMIN_CHAT_ID` 并在之后保存并执行重启（Docker 用 `docker compose restart`，直接安装用重启进程）。
-``` 
+
+### 已有实例升级提示词
+
+```text
+请安全升级服务器上的 tg-watchbot，不得丢失现有配置和数据：
+
+目标仓库：https://github.com/u1ra/tg-watchbot.git
+
+执行要求：
+1. 先定位实际项目目录，检查 git remote、当前分支、git status、Docker Compose 状态和磁盘空间。
+2. 如果存在未提交修改、来源不明文件或远端不是上述仓库，停止并向用户说明，不要 reset、checkout、clean 或强制覆盖。
+3. 在项目目录旁创建带时间戳的备份目录，只备份并校验以下存在的文件：
+   - .env
+   - config.yaml
+   - tg-watchbot.sqlite3
+   - docker-compose.yml
+   不要把备份提交到 Git。
+4. 执行 git fetch，然后使用 git pull --ff-only；不允许强制推送、hard reset 或自动解决冲突。
+5. 不要重新执行 cp .env.example .env 或 cp config.example.yaml config.yaml。新环境变量缺失时由程序使用安全默认值，之后可在 WebUI 中配置。
+6. 保持 BOT_VERIFICATION_ENABLED=false，除非它在升级前已经由用户明确启用；不要自动使用测试 key 或自动创建 Cloudflare 资源。
+7. 依次运行：
+   - docker compose config
+   - docker compose build
+   - docker compose run --rm --no-deps tg-watchbot python -m unittest discover -s tests -v
+   - docker compose up -d
+   - docker compose ps
+   - curl --fail http://127.0.0.1:8765/health
+8. 检查最近 200 行容器日志，确认没有数据库迁移错误、循环重启或验证配置错误；报告时隐藏所有敏感值。
+9. 验证 WebUI 仍可登录、原监控和用户数据仍存在，并确认普通监控编辑页出现“排除关键词”，设置页出现“新用户两阶段验证”。
+10. 如果升级失败，停止继续修改，保留现场和备份，汇报失败命令、错误摘要及可恢复路径；不要自行删除数据库。
+11. 最终汇报旧/新 commit、备份路径、测试结果、容器与健康状态，以及是否仍需配置正式 HTTPS/Turnstile。不要输出任何密钥内容。
+```
+
+### AI 部署验收标准
+
+- 容器状态为运行中，`/health` 返回 `ok`。
+- Web 面板仍只绑定在 `127.0.0.1:8765`，或已经由用户明确配置安全的 HTTPS 反代。
+- `.env` 权限为 `600`，数据库和配置文件没有被覆盖。
+- 默认面板密码已提醒修改，Token 等敏感值没有出现在聊天、日志摘要或 Git。
+- 全量测试通过；若不能通过，AI 必须明确报告，不能把部署描述为成功。
+- 新用户验证默认关闭。只有正式域名、sitekey、Spin Worker URL、hostname/action 全部确认后，才通过 WebUI 启用。
+
 ## 更新日志
+
+### 2026-07-27 更新
+
+- 普通 Web/RSS 监控新增“排除关键词”WebUI，支持保存和编辑回显，命中排除词时优先跳过。
+- 新增可选的新用户 Turnstile + 算数题两阶段验证，老用户一次性免验证。
+- 新增 Telegram Mini App、服务端 `initData` 验签、nonce 防重放、过期、失败冷却与安全响应头。
+- “设置”和“用户管理”均可维护全部非敏感验证参数；生产 Turnstile secret 仍只保存在 Spin Worker。
+- 新用户验证默认关闭，生产 Cloudflare 资源与真实 Telegram 联调需在最终 HTTPS 域名确定后执行。
 
 ### 2026-06-02 更新
 
@@ -185,7 +272,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 ## Docker 安装（含自启）
 
 ```bash
-git clone https://github.com/GongyiChuren/tg-watchbot.git tg-watchbot
+git clone https://github.com/u1ra/tg-watchbot.git tg-watchbot
 cd tg-watchbot
 cp .env.example .env
 cp config.example.yaml config.yaml
@@ -226,7 +313,7 @@ docker compose up -d --build
 ## 手动安装（Python）
 
 ```bash
-git clone https://github.com/GongyiChuren/tg-watchbot.git tg-watchbot
+git clone https://github.com/u1ra/tg-watchbot.git tg-watchbot
 cd tg-watchbot
 python3 -m venv .venv
 ./.venv/bin/pip install -U pip
@@ -276,7 +363,7 @@ sudo mkdir -p /opt/tg-watchbot
 sudo chown -R "$USER:$USER" /opt/tg-watchbot
 
 cd /opt/tg-watchbot
-git clone https://github.com/GongyiChuren/tg-watchbot.git .
+git clone https://github.com/u1ra/tg-watchbot.git .
 python3 -m venv .venv
 ./.venv/bin/pip install -U pip
 ./.venv/bin/pip install -r requirements.txt

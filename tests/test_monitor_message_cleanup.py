@@ -1032,6 +1032,29 @@ class BotConfigurationTest(unittest.TestCase):
         self.assertIn("1x00000000000000000000AA", readme)
         self.assertIn("secret 不应写入本项目", readme)
 
+    def test_readme_ai_deployment_prompts_use_current_repo_and_safe_defaults(self) -> None:
+        readme = Path("README.md").read_text(encoding="utf-8")
+        for expected in [
+            "AI 辅助部署",
+            "全新部署提示词",
+            "已有实例升级提示词",
+            "AI 部署验收标准",
+            "https://github.com/u1ra/tg-watchbot.git",
+            "不得覆盖已有 .env、config.yaml 或 SQLite 数据库",
+            "保持 BOT_VERIFICATION_ENABLED=false",
+            "不要输出任何密钥内容",
+        ]:
+            self.assertIn(expected, readme)
+        clone_lines = [
+            line.strip()
+            for line in readme.splitlines()
+            if line.strip().startswith("git clone ")
+        ]
+        self.assertTrue(clone_lines)
+        self.assertTrue(
+            all("github.com/u1ra/tg-watchbot.git" in line for line in clone_lines)
+        )
+
     def test_parse_admin_chat_ids_keeps_unique_first_three(self) -> None:
         self.assertEqual([1, 2, 3], app.parse_admin_chat_ids("1,2 2;3,4"))
 
