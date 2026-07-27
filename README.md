@@ -283,7 +283,7 @@ INF Registered tunnel connection connIndex=3 connection=... location=...
 | 日志/状态 | 原因和处理 |
 |---|---|
 | `error parsing token` / `Invalid token` | Token 复制不全或多了空格，重新从控制台复制 |
-| 一直 `Retrying connection` | VPS 出站被防火墙拦了，放行出站 `7844` 端口 |
+| 一直 `Retrying connection` | cloudflared 连 Cloudflare 用的是**出站** `7844` 端口（UDP/QUIC，失败自动回退 TCP）。普通 VPS 出站默认全放行，不会有这个问题；只有在出站被严格限制的网络（如只放行 80/443 的公司网络）才需要放行出站 `7844` |
 | 日志正常但控制台一直 `Inactive` | 等 1-2 分钟刷新；还不行就重建容器 `docker compose up -d --force-recreate` |
 
 ### 第 3 步：添加 Published application 路由
