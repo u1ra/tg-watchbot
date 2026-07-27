@@ -230,24 +230,22 @@ sudo install -d -m 700 -o "$USER" -g "$(id -gn)" /opt/tg-watchbot-cloudflared
 cd /opt/tg-watchbot-cloudflared
 ```
 
-**② 创建 `cloudflared.env`，内容只有一行**（把 `eyJ...` 换成第 1 步复制的 Token）：
+**② 写入 Token**——复制下面整段执行，然后在提示后**粘贴第 1 步的 Token 并回车**（输入不显示，是正常的）：
 
 ```bash
 umask 077
-nano cloudflared.env
+read -s -p "粘贴 Tunnel Token 后回车: " TUNNEL_TOKEN; echo
+printf 'TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" > cloudflared.env
+chmod 600 cloudflared.env
+unset TUNNEL_TOKEN
 ```
 
-```dotenv
-TUNNEL_TOKEN=eyJhIjoixxxxxxxxxxxxxxxxxxxxxxxx
-```
+执行完 `cloudflared.env` 里就只有一行 `TUNNEL_TOKEN=eyJ...`，可以用 `ls -l cloudflared.env` 确认权限是 `-rw-------`。
 
-**③ 创建 `compose.yaml`，内容原样照抄**（不用改任何地方）：
+**③ 创建 `compose.yaml`**——整段复制执行即可，不用改任何地方：
 
 ```bash
-nano compose.yaml
-```
-
-```yaml
+cat > compose.yaml <<'EOF'
 services:
   cloudflared:
     image: cloudflare/cloudflared:latest
@@ -257,6 +255,7 @@ services:
     command: tunnel --no-autoupdate --loglevel info run
     env_file:
       - ./cloudflared.env
+EOF
 ```
 
 **④ 启动并看日志：**
