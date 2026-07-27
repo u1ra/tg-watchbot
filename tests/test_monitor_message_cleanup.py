@@ -1,4 +1,8 @@
 import asyncio
+import hashlib
+import hmac
+import inspect
+import json
 import os
 import sqlite3
 import sys
@@ -7,6 +11,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from urllib.parse import urlencode
 
 
 def install_import_stubs() -> None:
@@ -19,6 +24,66 @@ def install_import_stubs() -> None:
 
     def identity_factory(*args, **kwargs):
         return object()
+
+    class DummyWebAppInfo:
+        def __init__(self, url: str):
+            self.url = url
+
+    class DummyInlineKeyboardButton:
+        def __init__(self, text: str, web_app=None):
+            self.text = text
+            self.web_app = web_app
+
+    class DummyInlineKeyboardMarkup:
+        def __init__(self, inline_keyboard):
+            self.inline_keyboard = inline_keyboard
+
+    class DummyResponse:
+        def __init__(self, content="", status_code=200, **kwargs):
+            self.content = content
+            self.status_code = status_code
+            self.headers = {}
+            self.cookies = {}
+
+        def set_cookie(self, key, value, **kwargs):
+            self.cookies[key] = (value, kwargs)
+
+        def delete_cookie(self, key, **kwargs):
+            self.cookies.pop(key, None)
+
+    class DummyRedirectResponse(DummyResponse):
+        def __init__(self, url, status_code=307, **kwargs):
+            super().__init__("", status_code, **kwargs)
+            self.url = url
+
+    class DummyJSONResponse(DummyResponse):
+        pass
+
+    class DummyFastAPI:
+        def __init__(self, *args, **kwargs):
+            self.routes = {}
+            self.middleware_handler = None
+
+        def middleware(self, middleware_type):
+            def decorator(func):
+                self.middleware_handler = func
+                return func
+
+            return decorator
+
+        def get(self, path, **kwargs):
+            def decorator(func):
+                self.routes[("GET", path)] = func
+                return func
+
+            return decorator
+
+        def post(self, path, **kwargs):
+            def decorator(func):
+                self.routes[("POST", path)] = func
+                return func
+
+            return decorator
 
     modules = {
         "feedparser": ModuleType("feedparser"),
@@ -54,18 +119,22 @@ def install_import_stubs() -> None:
     modules["aiogram.exceptions"].TelegramAPIError = Exception
     modules["aiogram.filters"].Command = identity_factory
     modules["aiogram.filters"].CommandObject = object
+    modules["aiogram.types"].InlineKeyboardButton = DummyInlineKeyboardButton
+    modules["aiogram.types"].InlineKeyboardMarkup = DummyInlineKeyboardMarkup
     modules["aiogram.types"].Message = object
+    modules["aiogram.types"].WebAppInfo = DummyWebAppInfo
     modules["aiogram.client.default"].DefaultBotProperties = identity_factory
     modules["fastapi"].Depends = identity_factory
-    modules["fastapi"].FastAPI = object
+    modules["fastapi"].FastAPI = DummyFastAPI
     modules["fastapi"].Form = identity_factory
     modules["fastapi"].HTTPException = Exception
     modules["fastapi"].Request = object
-    modules["fastapi"].Response = object
+    modules["fastapi"].Response = DummyResponse
     modules["fastapi"].status = object()
-    modules["fastapi.responses"].HTMLResponse = object
-    modules["fastapi.responses"].RedirectResponse = object
-    modules["fastapi.responses"].PlainTextResponse = object
+    modules["fastapi.responses"].HTMLResponse = DummyResponse
+    modules["fastapi.responses"].JSONResponse = DummyJSONResponse
+    modules["fastapi.responses"].RedirectResponse = DummyRedirectResponse
+    modules["fastapi.responses"].PlainTextResponse = DummyResponse
     modules["qrcode"].make = lambda *args, **kwargs: SimpleNamespace(save=lambda *a, **k: None)
     modules["uvicorn"].Server = object
     modules["uvicorn"].Config = identity_factory
@@ -92,6 +161,32 @@ class FakeBot:
         self.sent_chat_ids.append(chat_id)
         self.sent_texts.append(text)
         return SimpleNamespace(message_id=3003)
+
+
+class FakePrivateMessage:
+    def __init__(
+        self,
+        user_id: int,
+        text: str | None = None,
+        chat_type: str = "private",
+        content_type: str = "text",
+    ) -> None:
+        self.chat = SimpleNamespace(id=user_id, type=chat_type)
+        self.from_user = SimpleNamespace(
+            id=user_id,
+            first_name="Test",
+            last_name="User",
+            username=f"user{user_id}",
+        )
+        self.text = text
+        self.caption = None
+        self.content_type = content_type
+        self.message_id = 5001
+        self.answers: list[tuple[str, dict]] = []
+
+    async def answer(self, text: str, **kwargs):
+        self.answers.append((text, kwargs))
+        return SimpleNamespace(message_id=6001)
 
 
 class MonitorMessageCleanupTest(unittest.TestCase):
@@ -211,7 +306,755 @@ class MonitorMessageCleanupTest(unittest.TestCase):
         self.assertEqual(1, remaining)
 
 
+class UserVerificationStateTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.old_db_path = app.DB_PATH
+        app.DB_PATH = Path(self.temp_dir.name) / "verification.sqlite3"
+
+    def tearDown(self) -> None:
+        app.DB_PATH = self.old_db_path
+        self.temp_dir.cleanup()
+
+    def test_legacy_users_are_grandfathered_only_once(self) -> None:
+        with closing(sqlite3.connect(app.DB_PATH)) as conn:
+            conn.execute(
+                """
+                CREATE TABLE users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    full_name TEXT,
+                    note TEXT DEFAULT '',
+                    blocked INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO users(user_id, full_name, created_at, updated_at) VALUES(?,?,?,?)",
+                (1001, "Legacy", "before", "before"),
+            )
+            conn.commit()
+
+        app.init_db()
+        legacy = app.get_user_verification(1001)
+        self.assertIsNotNone(legacy)
+        self.assertEqual("verified", legacy["status"])
+        self.assertEqual("legacy", legacy["verification_method"])
+
+        app.upsert_user(1002, "New", "new")
+        app.init_db()
+        self.assertIsNone(app.get_user_verification(1002))
+
+    def test_turnstile_nonce_is_hashed_bound_and_expires(self) -> None:
+        app.init_db()
+        app.upsert_user(2001, "User", "user")
+        challenge = app.begin_turnstile_verification(2001, now_ts=1000, ttl_seconds=10)
+        row = app.get_user_verification(2001)
+
+        self.assertEqual("pending_turnstile", challenge["status"])
+        self.assertNotEqual(challenge["nonce"], row["turnstile_nonce_hash"])
+        self.assertEqual(app.verification_nonce_hash(challenge["nonce"]), row["turnstile_nonce_hash"])
+        self.assertTrue(app.turnstile_session_is_valid(2001, challenge["nonce"], now_ts=1009))
+        self.assertFalse(app.turnstile_session_is_valid(2002, challenge["nonce"], now_ts=1009))
+        self.assertFalse(app.turnstile_session_is_valid(2001, challenge["nonce"], now_ts=1010))
+
+    def test_turnstile_can_advance_only_once_to_math(self) -> None:
+        app.init_db()
+        app.upsert_user(2001, "User", "user")
+        challenge = app.begin_turnstile_verification(2001, now_ts=1000)
+
+        math = app.advance_turnstile_to_math(2001, challenge["nonce"], now_ts=1001)
+        duplicate = app.advance_turnstile_to_math(2001, challenge["nonce"], now_ts=1002)
+
+        self.assertIsNotNone(math)
+        self.assertEqual("pending_math", app.get_user_verification(2001)["status"])
+        self.assertIsNone(duplicate)
+
+    def test_math_challenges_stay_in_range_and_never_subtract_below_zero(self) -> None:
+        for _ in range(100):
+            question, answer = app.generate_math_challenge()
+            self.assertRegex(question, r"^\d+ [+-] \d+ = \?$")
+            self.assertGreaterEqual(answer, 0)
+            self.assertLessEqual(answer, 40)
+
+    def test_math_answer_verifies_or_enters_cooldown_after_three_errors(self) -> None:
+        app.init_db()
+        app.upsert_user(2001, "User", "user")
+        challenge = app.begin_turnstile_verification(2001, now_ts=1000)
+        app.advance_turnstile_to_math(2001, challenge["nonce"], now_ts=1001)
+        row = app.get_user_verification(2001)
+        correct_answer = int(row["math_answer"])
+        wrong_answer = str(correct_answer + 1)
+
+        invalid = app.submit_math_verification(2001, "not-a-number", now_ts=1002)
+        self.assertEqual("invalid", invalid["result"])
+        self.assertEqual(0, app.get_user_verification(2001)["math_attempts"])
+
+        self.assertEqual(
+            "incorrect",
+            app.submit_math_verification(2001, wrong_answer, now_ts=1003)["result"],
+        )
+        self.assertEqual(
+            "incorrect",
+            app.submit_math_verification(2001, wrong_answer, now_ts=1004)["result"],
+        )
+        cooldown = app.submit_math_verification(2001, wrong_answer, now_ts=1005)
+        self.assertEqual("cooldown", cooldown["result"])
+        self.assertEqual("cooldown", app.get_user_verification(2001)["status"])
+        self.assertEqual(
+            "pending_turnstile",
+            app.normalize_user_verification(2001, now_ts=1605)["status"],
+        )
+
+        restarted = app.begin_turnstile_verification(2001, now_ts=1606)
+        app.advance_turnstile_to_math(2001, restarted["nonce"], now_ts=1607)
+        correct_answer = str(app.get_user_verification(2001)["math_answer"])
+        self.assertEqual(
+            "verified",
+            app.submit_math_verification(2001, correct_answer, now_ts=1608)["result"],
+        )
+        self.assertTrue(app.is_user_verified(2001))
+
+    def test_expired_math_returns_to_turnstile_without_verifying(self) -> None:
+        app.init_db()
+        app.upsert_user(2001, "User", "user")
+        challenge = app.begin_turnstile_verification(2001, now_ts=1000)
+        app.advance_turnstile_to_math(2001, challenge["nonce"], now_ts=1001, ttl_seconds=10)
+        answer = str(app.get_user_verification(2001)["math_answer"])
+
+        result = app.submit_math_verification(2001, answer, now_ts=1011)
+
+        self.assertEqual("expired", result["result"])
+        self.assertFalse(app.is_user_verified(2001))
+        self.assertEqual("pending_turnstile", app.get_user_verification(2001)["status"])
+
+
+class PrivateVerificationGateTest(unittest.TestCase):
+    ENV_KEYS = [
+        "BOT_VERIFICATION_ENABLED",
+        "BOT_VERIFICATION_PUBLIC_BASE_URL",
+        "BOT_VERIFICATION_SESSION_TTL_SECONDS",
+        "BOT_VERIFICATION_MATH_MAX_ATTEMPTS",
+        "BOT_VERIFICATION_COOLDOWN_SECONDS",
+        "BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS",
+        "TURNSTILE_SITE_KEY",
+        "TURNSTILE_VERIFY_ENDPOINT",
+        "TURNSTILE_EXPECTED_HOSTNAME",
+        "TURNSTILE_EXPECTED_ACTION",
+        "TURNSTILE_TEST_MODE",
+    ]
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.old_db_path = app.DB_PATH
+        self.old_admin_chat_id = app.admin_chat_id
+        self.old_admin_chat_ids = app.admin_chat_ids
+        self.old_env = {key: os.environ.get(key) for key in self.ENV_KEYS}
+        app.DB_PATH = Path(self.temp_dir.name) / "gate.sqlite3"
+        app.admin_chat_id = None
+        app.admin_chat_ids = []
+        app.verification_prompt_times.clear()
+        os.environ["BOT_VERIFICATION_ENABLED"] = "true"
+        os.environ["BOT_VERIFICATION_PUBLIC_BASE_URL"] = "https://verify.example.test"
+        os.environ["BOT_VERIFICATION_SESSION_TTL_SECONDS"] = "600"
+        os.environ["BOT_VERIFICATION_MATH_MAX_ATTEMPTS"] = "3"
+        os.environ["BOT_VERIFICATION_COOLDOWN_SECONDS"] = "600"
+        os.environ["BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS"] = "15"
+        os.environ["TURNSTILE_SITE_KEY"] = "test-site-key"
+        os.environ["TURNSTILE_VERIFY_ENDPOINT"] = "https://worker.example.test"
+        os.environ["TURNSTILE_EXPECTED_HOSTNAME"] = "verify.example.test"
+        os.environ["TURNSTILE_EXPECTED_ACTION"] = "turnstile-spin-v1"
+        os.environ["TURNSTILE_TEST_MODE"] = "false"
+        app.init_db()
+
+    def tearDown(self) -> None:
+        app.DB_PATH = self.old_db_path
+        app.admin_chat_id = self.old_admin_chat_id
+        app.admin_chat_ids = self.old_admin_chat_ids
+        app.verification_prompt_times.clear()
+        for key, value in self.old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.temp_dir.cleanup()
+
+    def test_first_private_message_is_discarded_and_gets_web_app_button(self) -> None:
+        message = FakePrivateMessage(3001, "这是第一条消息")
+
+        allowed = asyncio.run(app.handle_private_verification_gate(message, now_ts=1000))
+
+        self.assertFalse(allowed)
+        self.assertTrue(app.should_gate_private_message(message))
+        self.assertEqual("pending_turnstile", app.get_user_verification(3001)["status"])
+        self.assertIn("首次联系需要完成", message.answers[0][0])
+        markup = message.answers[0][1]["reply_markup"]
+        button = markup.inline_keyboard[0][0]
+        self.assertEqual("开始人机验证", button.text)
+        self.assertTrue(button.web_app.url.startswith("https://verify.example.test/verify/telegram?nonce="))
+        with closing(sqlite3.connect(app.DB_PATH)) as conn:
+            inbox_count = conn.execute("SELECT COUNT(*) FROM inbox_messages").fetchone()[0]
+        self.assertEqual(0, inbox_count)
+
+    def test_repeated_messages_do_not_regenerate_prompt_inside_interval(self) -> None:
+        first = FakePrivateMessage(3001, "one")
+        second = FakePrivateMessage(3001, "two")
+
+        asyncio.run(app.handle_private_verification_gate(first, now_ts=1000))
+        first_hash = app.get_user_verification(3001)["turnstile_nonce_hash"]
+        asyncio.run(app.handle_private_verification_gate(second, now_ts=1001))
+
+        self.assertEqual([], second.answers)
+        self.assertEqual(first_hash, app.get_user_verification(3001)["turnstile_nonce_hash"])
+
+    def test_active_turnstile_session_is_not_regenerated_after_prompt_interval(self) -> None:
+        first = FakePrivateMessage(3001, "one")
+        later = FakePrivateMessage(3001, "two")
+
+        asyncio.run(app.handle_private_verification_gate(first, now_ts=1000))
+        first_hash = app.get_user_verification(3001)["turnstile_nonce_hash"]
+        asyncio.run(app.handle_private_verification_gate(later, now_ts=1016))
+
+        self.assertEqual(first_hash, app.get_user_verification(3001)["turnstile_nonce_hash"])
+        self.assertIn("上一条人机验证入口仍有效", later.answers[0][0])
+        self.assertNotIn("reply_markup", later.answers[0][1])
+
+    def test_math_stage_ignores_media_then_accepts_correct_text_answer(self) -> None:
+        app.upsert_user(3001, "Test User", "user3001")
+        challenge = app.begin_turnstile_verification(3001, now_ts=1000)
+        app.advance_turnstile_to_math(3001, challenge["nonce"], now_ts=1001)
+        answer = str(app.get_user_verification(3001)["math_answer"])
+
+        media = FakePrivateMessage(3001, None, content_type="photo")
+        self.assertFalse(asyncio.run(app.handle_private_verification_gate(media, now_ts=1002)))
+        self.assertIn("请输入算数题的数字答案", media.answers[0][0])
+        self.assertEqual(0, app.get_user_verification(3001)["math_attempts"])
+
+        correct = FakePrivateMessage(3001, answer)
+        self.assertFalse(asyncio.run(app.handle_private_verification_gate(correct, now_ts=1003)))
+        self.assertIn("验证成功", correct.answers[0][0])
+        self.assertTrue(app.is_user_verified(3001))
+        self.assertFalse(app.should_gate_private_message(correct))
+
+    def test_blocked_user_is_rejected_before_verification(self) -> None:
+        app.upsert_user(3001, "Test User", "user3001")
+        app.set_block(3001, True)
+        message = FakePrivateMessage(3001, "/start")
+
+        allowed = asyncio.run(app.handle_private_verification_gate(message, now_ts=1000))
+
+        self.assertFalse(allowed)
+        self.assertEqual("你当前无法发送消息。", message.answers[0][0])
+        self.assertIsNone(app.get_user_verification(3001))
+
+    def test_admin_group_and_disabled_modes_bypass_gate(self) -> None:
+        private = FakePrivateMessage(3001, "hello")
+        app.admin_chat_ids = [3001]
+        self.assertFalse(app.should_gate_private_message(private))
+        self.assertTrue(asyncio.run(app.handle_private_verification_gate(private, now_ts=1000)))
+
+        app.admin_chat_ids = []
+        group = FakePrivateMessage(3001, "hello", chat_type="group")
+        self.assertFalse(app.should_gate_private_message(group))
+        self.assertTrue(asyncio.run(app.handle_private_verification_gate(group, now_ts=1000)))
+
+        os.environ["BOT_VERIFICATION_ENABLED"] = "false"
+        self.assertFalse(app.should_gate_private_message(private))
+        self.assertTrue(asyncio.run(app.handle_private_verification_gate(private, now_ts=1000)))
+
+    def test_missing_https_public_url_fails_closed(self) -> None:
+        os.environ["BOT_VERIFICATION_PUBLIC_BASE_URL"] = "http://127.0.0.1:8765"
+        message = FakePrivateMessage(3001, "hello")
+
+        allowed = asyncio.run(app.handle_private_verification_gate(message, now_ts=1000))
+
+        self.assertFalse(allowed)
+        self.assertIn("暂不可用", message.answers[0][0])
+        self.assertFalse(app.is_user_verified(3001))
+
+
+class TurnstileVerificationTest(unittest.TestCase):
+    ENV_KEYS = [
+        "TELEGRAM_BOT_TOKEN",
+        "BOT_VERIFICATION_ENABLED",
+        "BOT_VERIFICATION_PUBLIC_BASE_URL",
+        "BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS",
+        "BOT_VERIFICATION_MATH_TTL_SECONDS",
+        "BOT_VERIFICATION_MATH_MAX_ATTEMPTS",
+        "TURNSTILE_SITE_KEY",
+        "TURNSTILE_VERIFY_ENDPOINT",
+        "TURNSTILE_EXPECTED_HOSTNAME",
+        "TURNSTILE_EXPECTED_ACTION",
+        "TURNSTILE_TEST_MODE",
+    ]
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.old_db_path = app.DB_PATH
+        self.old_bot = app.bot
+        self.old_env = {key: os.environ.get(key) for key in self.ENV_KEYS}
+        app.DB_PATH = Path(self.temp_dir.name) / "turnstile.sqlite3"
+        app.bot = None
+        app.verification_api_buckets.clear()
+        os.environ.update(
+            {
+                "TELEGRAM_BOT_TOKEN": "123456:test-token",
+                "BOT_VERIFICATION_ENABLED": "true",
+                "BOT_VERIFICATION_PUBLIC_BASE_URL": "https://verify.example.test",
+                "BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS": "300",
+                "BOT_VERIFICATION_MATH_TTL_SECONDS": "600",
+                "BOT_VERIFICATION_MATH_MAX_ATTEMPTS": "3",
+                "TURNSTILE_SITE_KEY": "test-site-key",
+                "TURNSTILE_VERIFY_ENDPOINT": "https://worker.example.test",
+                "TURNSTILE_EXPECTED_HOSTNAME": "verify.example.test",
+                "TURNSTILE_EXPECTED_ACTION": "turnstile-spin-v1",
+                "TURNSTILE_TEST_MODE": "false",
+            }
+        )
+        app.init_db()
+
+    def tearDown(self) -> None:
+        app.DB_PATH = self.old_db_path
+        app.bot = self.old_bot
+        app.verification_api_buckets.clear()
+        for key, value in self.old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def signed_init_data(
+        user_id: int,
+        auth_date: int,
+        bot_token: str = "123456:test-token",
+    ) -> str:
+        values = {
+            "auth_date": str(auth_date),
+            "query_id": "AAE-test-query",
+            "user": json.dumps(
+                {"id": user_id, "first_name": "Test", "is_bot": False},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        }
+        data_check_string = "\n".join(f"{key}={values[key]}" for key in sorted(values))
+        secret_key = hmac.new(
+            b"WebAppData",
+            bot_token.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        values["hash"] = hmac.new(
+            secret_key,
+            data_check_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return urlencode(values)
+
+    def test_telegram_init_data_checks_signature_age_and_duplicate_keys(self) -> None:
+        valid = self.signed_init_data(4001, auth_date=1000)
+        identity = app.validate_telegram_init_data(
+            valid,
+            "123456:test-token",
+            max_age_seconds=300,
+            now_ts=1001,
+        )
+        self.assertEqual(4001, identity["user_id"])
+        self.assertIsNone(
+            app.validate_telegram_init_data(
+                valid.replace("Test", "Mallory"),
+                "123456:test-token",
+                now_ts=1001,
+            )
+        )
+        self.assertIsNone(
+            app.validate_telegram_init_data(
+                valid,
+                "123456:test-token",
+                max_age_seconds=300,
+                now_ts=1301,
+            )
+        )
+        self.assertIsNone(
+            app.validate_telegram_init_data(
+                valid + "&auth_date=1000",
+                "123456:test-token",
+                now_ts=1001,
+            )
+        )
+
+    def test_verification_page_has_required_sdk_action_and_same_origin_api(self) -> None:
+        page = app.verification_page_html(
+            "safe_nonce-123",
+            app.verification_settings(),
+            "csp-nonce",
+        )
+        self.assertIn("https://telegram.org/js/telegram-web-app.js", page)
+        self.assertIn("https://challenges.cloudflare.com/turnstile/v0/api.js", page)
+        self.assertIn('data-action="turnstile-spin-v1"', page)
+        self.assertIn('"turnstile-spin-v1"', page)
+        self.assertIn('"test-site-key"', page)
+        self.assertIn('fetch("/api/verify/turnstile"', page)
+        self.assertIn('"safe_nonce-123"', page)
+        self.assertNotIn("123456:test-token", page)
+
+    def test_configuration_fails_closed_and_test_mode_is_loopback_only(self) -> None:
+        settings = app.verification_settings()
+        self.assertEqual("", app.turnstile_configuration_error(settings))
+
+        missing_endpoint = dict(settings, turnstile_verify_endpoint="")
+        self.assertEqual(
+            "missing-secure-verify-endpoint",
+            app.turnstile_configuration_error(missing_endpoint),
+        )
+        public_test_mode = dict(settings, turnstile_test_mode=True)
+        self.assertEqual(
+            "test-mode-requires-loopback-host",
+            app.turnstile_configuration_error(public_test_mode),
+        )
+        local_test_mode = dict(
+            settings,
+            turnstile_test_mode=True,
+            public_base_url="http://127.0.0.1:8765",
+            turnstile_verify_endpoint="",
+            turnstile_expected_hostname="",
+        )
+        self.assertEqual("", app.turnstile_configuration_error(local_test_mode))
+
+    def test_turnstile_success_advances_once_and_sends_math_question(self) -> None:
+        app.upsert_user(4001, "Test User", "testuser")
+        challenge = app.begin_turnstile_verification(4001, now_ts=1000)
+        init_data = self.signed_init_data(4001, auth_date=1000)
+        old_verify = app.verify_turnstile_token
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+
+        async def valid_turnstile(token, remote_ip="", settings=None):
+            self.assertEqual("turnstile-token", token)
+            return {
+                "success": True,
+                "hostname": "verify.example.test",
+                "action": "turnstile-spin-v1",
+            }
+
+        app.verify_turnstile_token = valid_turnstile
+        try:
+            result = asyncio.run(
+                app.complete_turnstile_verification(
+                    init_data,
+                    challenge["nonce"],
+                    "turnstile-token",
+                    now_ts=1001,
+                )
+            )
+            replay = asyncio.run(
+                app.complete_turnstile_verification(
+                    init_data,
+                    challenge["nonce"],
+                    "turnstile-token",
+                    now_ts=1002,
+                )
+            )
+        finally:
+            app.verify_turnstile_token = old_verify
+
+        self.assertEqual({"ok": True, "question_sent": True}, result)
+        self.assertFalse(replay["ok"])
+        self.assertEqual("pending_math", app.get_user_verification(4001)["status"])
+        self.assertEqual([4001], fake_bot.sent_chat_ids)
+        self.assertIn("第二阶段算数题", fake_bot.sent_texts[0])
+
+    def test_concurrent_success_callbacks_only_send_one_math_question(self) -> None:
+        app.upsert_user(4001, "Test User", "testuser")
+        challenge = app.begin_turnstile_verification(4001, now_ts=1000)
+        init_data = self.signed_init_data(4001, auth_date=1000)
+        old_verify = app.verify_turnstile_token
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+
+        async def valid_turnstile(token, remote_ip="", settings=None):
+            await asyncio.sleep(0)
+            return {
+                "success": True,
+                "hostname": "verify.example.test",
+                "action": "turnstile-spin-v1",
+            }
+
+        async def run_callbacks():
+            return await asyncio.gather(
+                app.complete_turnstile_verification(
+                    init_data,
+                    challenge["nonce"],
+                    "token-one",
+                    now_ts=1001,
+                ),
+                app.complete_turnstile_verification(
+                    init_data,
+                    challenge["nonce"],
+                    "token-two",
+                    now_ts=1001,
+                ),
+            )
+
+        app.verify_turnstile_token = valid_turnstile
+        try:
+            results = asyncio.run(run_callbacks())
+        finally:
+            app.verify_turnstile_token = old_verify
+
+        self.assertEqual(1, sum(1 for result in results if result["ok"]))
+        self.assertEqual([4001], fake_bot.sent_chat_ids)
+        self.assertEqual("pending_math", app.get_user_verification(4001)["status"])
+
+    def test_turnstile_mismatch_and_wrong_nonce_do_not_advance(self) -> None:
+        app.upsert_user(4001, "Test User", "testuser")
+        challenge = app.begin_turnstile_verification(4001, now_ts=1000)
+        init_data = self.signed_init_data(4001, auth_date=1000)
+        old_verify = app.verify_turnstile_token
+        calls = []
+
+        async def wrong_action(token, remote_ip="", settings=None):
+            calls.append(token)
+            return {
+                "success": True,
+                "hostname": "verify.example.test",
+                "action": "unexpected-action",
+            }
+
+        app.verify_turnstile_token = wrong_action
+        try:
+            wrong_nonce = asyncio.run(
+                app.complete_turnstile_verification(
+                    init_data,
+                    "wrong-nonce",
+                    "turnstile-token",
+                    now_ts=1001,
+                )
+            )
+            mismatch = asyncio.run(
+                app.complete_turnstile_verification(
+                    init_data,
+                    challenge["nonce"],
+                    "turnstile-token",
+                    now_ts=1001,
+                )
+            )
+        finally:
+            app.verify_turnstile_token = old_verify
+
+        self.assertEqual("invalid-or-expired-challenge", wrong_nonce["error"])
+        self.assertEqual(["turnstile-token"], calls)
+        self.assertEqual("turnstile-action-mismatch", mismatch["error"])
+        self.assertEqual("pending_turnstile", app.get_user_verification(4001)["status"])
+
+    def test_turnstile_hostname_mismatch_and_network_failure_fail_closed(self) -> None:
+        app.upsert_user(4001, "Test User", "testuser")
+        challenge = app.begin_turnstile_verification(4001, now_ts=1000)
+        init_data = self.signed_init_data(4001, auth_date=1000)
+        old_verify = app.verify_turnstile_token
+
+        async def wrong_hostname(token, remote_ip="", settings=None):
+            return {
+                "success": True,
+                "hostname": "attacker.example.test",
+                "action": "turnstile-spin-v1",
+            }
+
+        app.verify_turnstile_token = wrong_hostname
+        try:
+            mismatch = asyncio.run(
+                app.complete_turnstile_verification(
+                    init_data,
+                    challenge["nonce"],
+                    "turnstile-token",
+                    now_ts=1001,
+                )
+            )
+        finally:
+            app.verify_turnstile_token = old_verify
+        self.assertEqual("turnstile-hostname-mismatch", mismatch["error"])
+        self.assertEqual("pending_turnstile", app.get_user_verification(4001)["status"])
+
+        old_client = getattr(app.httpx, "AsyncClient", None)
+
+        class FailingClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+            async def post(self, *args, **kwargs):
+                raise TimeoutError("simulated")
+
+        app.httpx.AsyncClient = FailingClient
+        try:
+            with self.assertLogs("tg-watchbot", level="WARNING"):
+                result = asyncio.run(
+                    app.verify_turnstile_token(
+                        "turnstile-token",
+                        settings=app.verification_settings(),
+                    )
+                )
+        finally:
+            if old_client is None:
+                delattr(app.httpx, "AsyncClient")
+            else:
+                app.httpx.AsyncClient = old_client
+        self.assertFalse(result["success"])
+        self.assertEqual(["verification-request-failed"], result["error-codes"])
+
+    def test_public_routes_are_exact_and_security_headers_are_strict(self) -> None:
+        self.assertTrue(app.panel_path_is_public("/verify/telegram"))
+        self.assertTrue(app.panel_path_is_public("/api/verify/turnstile"))
+        self.assertFalse(app.panel_path_is_public("/verify/telegram/anything"))
+        response = SimpleNamespace(headers={})
+        app.apply_verification_security_headers(response, "safe-csp-nonce")
+        self.assertEqual("no-store, max-age=0", response.headers["Cache-Control"])
+        self.assertIn(
+            "https://challenges.cloudflare.com",
+            response.headers["Content-Security-Policy"],
+        )
+        self.assertIn("'nonce-safe-csp-nonce'", response.headers["Content-Security-Policy"])
+
+    def test_verification_api_rate_limit_uses_sliding_window(self) -> None:
+        for index in range(10):
+            self.assertFalse(
+                app.verification_api_rate_limited("127.0.0.1", now_ts=1000 + index)
+            )
+        self.assertTrue(app.verification_api_rate_limited("127.0.0.1", now_ts=1010))
+        self.assertFalse(app.verification_api_rate_limited("127.0.0.1", now_ts=1071))
+
+    def test_panel_routes_serve_verification_without_opening_protected_pages(self) -> None:
+        panel = app.create_panel_app()
+        page_route = panel.routes[("GET", "/verify/telegram")]
+        page_response = asyncio.run(page_route("safe_nonce-123"))
+        self.assertEqual(200, page_response.status_code)
+        self.assertIn("请完成人机验证", page_response.content)
+        self.assertIn("Content-Security-Policy", page_response.headers)
+
+        public_request = SimpleNamespace(
+            url=SimpleNamespace(path="/verify/telegram"),
+            headers={},
+            cookies={},
+            client=SimpleNamespace(host="127.0.0.1"),
+        )
+        protected_request = SimpleNamespace(
+            url=SimpleNamespace(path="/users"),
+            headers={},
+            cookies={},
+            client=SimpleNamespace(host="127.0.0.1"),
+        )
+
+        async def call_next(request):
+            return sys.modules["fastapi.responses"].HTMLResponse("ok")
+
+        public_response = asyncio.run(panel.middleware_handler(public_request, call_next))
+        protected_response = asyncio.run(panel.middleware_handler(protected_request, call_next))
+        self.assertEqual(200, public_response.status_code)
+        self.assertEqual("no-store, max-age=0", public_response.headers["Cache-Control"])
+        self.assertEqual(303, protected_response.status_code)
+        self.assertEqual("/login", protected_response.url)
+
+    def test_panel_api_maps_callback_result_and_rejects_oversized_body(self) -> None:
+        panel = app.create_panel_app()
+        api_route = panel.routes[("POST", "/api/verify/turnstile")]
+        old_complete = app.complete_turnstile_verification
+
+        async def accepted(*args, **kwargs):
+            return {"ok": True, "question_sent": True}
+
+        request = SimpleNamespace(
+            client=SimpleNamespace(host="127.0.0.1"),
+            url=SimpleNamespace(path="/api/verify/turnstile"),
+            headers={},
+            cookies={},
+        )
+        app.complete_turnstile_verification = accepted
+        try:
+            response = asyncio.run(
+                api_route(
+                    request,
+                    "signed-init-data",
+                    "safe_nonce-123",
+                    "turnstile-token",
+                )
+            )
+        finally:
+            app.complete_turnstile_verification = old_complete
+        self.assertEqual(200, response.status_code)
+        self.assertEqual({"ok": True, "question_sent": True}, response.content)
+
+        oversized_request = SimpleNamespace(
+            client=SimpleNamespace(host="127.0.0.1"),
+            url=SimpleNamespace(path="/api/verify/turnstile"),
+            headers={"content-length": "20000"},
+            cookies={},
+        )
+
+        async def should_not_run(request):
+            raise AssertionError("oversized request reached route")
+
+        oversized = asyncio.run(
+            panel.middleware_handler(oversized_request, should_not_run)
+        )
+        self.assertEqual(413, oversized.status_code)
+
+
 class BotConfigurationTest(unittest.TestCase):
+    def test_env_example_documents_verification_without_a_secret(self) -> None:
+        env_example = Path(".env.example").read_text(encoding="utf-8")
+        for key in [
+            "BOT_VERIFICATION_ENABLED=false",
+            "BOT_VERIFICATION_PUBLIC_BASE_URL=",
+            "BOT_VERIFICATION_MATH_TTL_SECONDS=600",
+            "BOT_VERIFICATION_MATH_MAX_ATTEMPTS=3",
+            "TURNSTILE_SITE_KEY=",
+            "TURNSTILE_VERIFY_ENDPOINT=",
+            "TURNSTILE_EXPECTED_HOSTNAME=",
+            "TURNSTILE_EXPECTED_ACTION=turnstile-spin-v1",
+            "TURNSTILE_TEST_MODE=false",
+        ]:
+            self.assertIn(key, env_example)
+        self.assertNotIn("TURNSTILE_SECRET_KEY=", env_example)
+
+    def test_readme_documents_local_and_production_verification_boundaries(self) -> None:
+        readme = Path("README.md").read_text(encoding="utf-8")
+        self.assertIn("新用户两阶段验证", readme)
+        self.assertIn("本地开发与测试", readme)
+        self.assertIn("生产部署", readme)
+        self.assertIn("1x00000000000000000000AA", readme)
+        self.assertIn("secret 不应写入本项目", readme)
+
+    def test_readme_ai_deployment_prompts_use_current_repo_and_safe_defaults(self) -> None:
+        readme = Path("README.md").read_text(encoding="utf-8")
+        for expected in [
+            "AI 辅助部署",
+            "全新部署提示词",
+            "已有实例升级提示词",
+            "AI 部署验收标准",
+            "https://github.com/u1ra/tg-watchbot.git",
+            "不得覆盖已有 .env、config.yaml 或 SQLite 数据库",
+            "保持 BOT_VERIFICATION_ENABLED=false",
+            "不要输出任何密钥内容",
+        ]:
+            self.assertIn(expected, readme)
+        clone_lines = [
+            line.strip()
+            for line in readme.splitlines()
+            if line.strip().startswith("git clone ")
+        ]
+        self.assertTrue(clone_lines)
+        self.assertTrue(
+            all("github.com/u1ra/tg-watchbot.git" in line for line in clone_lines)
+        )
+
     def test_parse_admin_chat_ids_keeps_unique_first_three(self) -> None:
         self.assertEqual([1, 2, 3], app.parse_admin_chat_ids("1,2 2;3,4"))
 
@@ -262,6 +1105,76 @@ class BotConfigurationTest(unittest.TestCase):
             finally:
                 app.ENV_PATH = old_env_path
 
+    def test_write_env_values_preserves_verification_and_unknown_existing_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_env_path = app.ENV_PATH
+            app.ENV_PATH = Path(temp_dir) / ".env"
+            app.ENV_PATH.write_text(
+                "BOT_VERIFICATION_ENABLED=true\n"
+                "TURNSTILE_SITE_KEY=existing-site-key\n"
+                "CUSTOM_DEPLOYMENT_VALUE=keep-me\n",
+                encoding="utf-8",
+            )
+            try:
+                app.write_env_values({"LOG_LEVEL": "DEBUG"})
+                saved = app.ENV_PATH.read_text(encoding="utf-8")
+            finally:
+                app.ENV_PATH = old_env_path
+        self.assertIn("BOT_VERIFICATION_ENABLED=true", saved)
+        self.assertIn("TURNSTILE_SITE_KEY=existing-site-key", saved)
+        self.assertIn("CUSTOM_DEPLOYMENT_VALUE=keep-me", saved)
+
+    def test_verification_form_normalizes_booleans_numbers_and_hostname(self) -> None:
+        normalized = app.normalize_verification_form_values(
+            {
+                "BOT_VERIFICATION_ENABLED": "on",
+                "TURNSTILE_TEST_MODE": "",
+                "BOT_VERIFICATION_PUBLIC_BASE_URL": "https://bot.example.com/",
+                "BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS": "0",
+                "BOT_VERIFICATION_SESSION_TTL_SECONDS": "invalid",
+                "BOT_VERIFICATION_MATH_TTL_SECONDS": "900",
+                "BOT_VERIFICATION_MATH_MAX_ATTEMPTS": "5",
+                "BOT_VERIFICATION_COOLDOWN_SECONDS": "1200",
+                "BOT_VERIFICATION_PROMPT_INTERVAL_SECONDS": "20",
+                "TURNSTILE_SITE_KEY": " site-key ",
+                "TURNSTILE_VERIFY_ENDPOINT": " https://worker.example.test ",
+                "TURNSTILE_EXPECTED_HOSTNAME": "Bot.Example.COM.",
+                "TURNSTILE_EXPECTED_ACTION": "",
+            }
+        )
+        self.assertEqual("true", normalized["BOT_VERIFICATION_ENABLED"])
+        self.assertEqual("false", normalized["TURNSTILE_TEST_MODE"])
+        self.assertEqual("https://bot.example.com", normalized["BOT_VERIFICATION_PUBLIC_BASE_URL"])
+        self.assertEqual("1", normalized["BOT_VERIFICATION_INITDATA_MAX_AGE_SECONDS"])
+        self.assertEqual("600", normalized["BOT_VERIFICATION_SESSION_TTL_SECONDS"])
+        self.assertEqual("bot.example.com", normalized["TURNSTILE_EXPECTED_HOSTNAME"])
+        self.assertEqual("turnstile-spin-v1", normalized["TURNSTILE_EXPECTED_ACTION"])
+
+    def test_verification_admin_form_exposes_all_non_secret_parameters(self) -> None:
+        values = dict(app.VERIFICATION_ENV_DEFAULTS)
+        values.update(
+            {
+                "WEB_PANEL_ENABLED": "true",
+                "BOT_VERIFICATION_ENABLED": "true",
+                "BOT_VERIFICATION_PUBLIC_BASE_URL": "https://bot.example.com",
+                "TURNSTILE_SITE_KEY": "site-key",
+                "TURNSTILE_VERIFY_ENDPOINT": "https://worker.example.test",
+                "TURNSTILE_EXPECTED_HOSTNAME": "bot.example.com",
+            }
+        )
+        form = app.verification_settings_form_html(values)
+        for key in app.VERIFICATION_ENV_DEFAULTS:
+            self.assertIn(f"name={key}", form)
+        self.assertIn("必要参数完整", form)
+        self.assertNotIn("name=TURNSTILE_SECRET", form)
+
+    def test_both_admin_settings_routes_accept_verification_fields(self) -> None:
+        panel = app.create_panel_app()
+        expected = set(app.VERIFICATION_ENV_DEFAULTS)
+        for route_key in [("POST", "/settings"), ("POST", "/users/settings")]:
+            route_fields = set(inspect.signature(panel.routes[route_key]).parameters)
+            self.assertTrue(expected.issubset(route_fields))
+
 
 class PanelHtmlContractTest(unittest.TestCase):
     def test_login_form_keeps_expected_fields(self) -> None:
@@ -295,6 +1208,7 @@ class PanelHtmlContractTest(unittest.TestCase):
             "name=url",
             "name=interval_seconds",
             "name=keywords",
+            "name=exclude_keywords",
             "name=item_selector",
             "name=title_selector",
             "name=link_selector",
@@ -325,12 +1239,55 @@ class PanelHtmlContractTest(unittest.TestCase):
             "",
             "",
             "",
+            "",
             True,
             True,
             False,
             False,
         )
         self.assertEqual(1, monitor["interval_seconds"])
+
+    def test_monitor_form_places_exclude_keywords_after_keywords_and_round_trips_values(self) -> None:
+        html = app.monitor_form_html({
+            "type": "rss",
+            "keywords": ["VPS", "优惠"],
+            "exclude_keywords": ["广告", "已售"],
+            "notify_on": {"keyword_match": True},
+        })
+        keywords_pos = html.index("name=keywords")
+        exclude_pos = html.index("name=exclude_keywords")
+        selectors_pos = html.index("Web 选择器")
+        self.assertLess(keywords_pos, exclude_pos)
+        self.assertLess(exclude_pos, selectors_pos)
+        self.assertIn("广告\n已售", html)
+
+    def test_monitor_from_form_parses_exclude_keywords_and_item_blocked_uses_them(self) -> None:
+        monitor = app.monitor_from_form(
+            None,
+            "测试",
+            "rss",
+            "https://example.com/feed",
+            30,
+            "VPS\n优惠",
+            "广告\n已售",
+            "",
+            "",
+            "",
+            "",
+            "",
+            True,
+            True,
+            False,
+            False,
+        )
+        self.assertEqual(["VPS", "优惠"], monitor["keywords"])
+        self.assertEqual(["广告", "已售"], monitor["exclude_keywords"])
+        blocked, reason = app.item_blocked(
+            app.MonitorItem("item-1", "VPS 优惠", "https://example.com/1", "这是广告内容"),
+            monitor,
+        )
+        self.assertTrue(blocked)
+        self.assertIn("广告", reason)
 
     def test_monitor_form_can_disable_telegram_notification(self) -> None:
         monitor = {
