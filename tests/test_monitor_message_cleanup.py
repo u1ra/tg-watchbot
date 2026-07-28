@@ -135,6 +135,7 @@ def install_import_stubs() -> None:
     modules["fastapi.responses"].JSONResponse = DummyJSONResponse
     modules["fastapi.responses"].RedirectResponse = DummyRedirectResponse
     modules["fastapi.responses"].PlainTextResponse = DummyResponse
+    modules["fastapi.responses"].FileResponse = DummyResponse
     modules["qrcode"].make = lambda *args, **kwargs: SimpleNamespace(save=lambda *a, **k: None)
     modules["uvicorn"].Server = object
     modules["uvicorn"].Config = identity_factory
