@@ -48,7 +48,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 from aiogram.client.default import DefaultBotProperties
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, status
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse, FileResponse
 import uvicorn
 
 try:
@@ -64,6 +64,11 @@ DB_PATH = BASE_DIR / "tg-watchbot.sqlite3"
 CONFIG_PATH = BASE_DIR / "config.yaml"
 ENV_PATH = BASE_DIR / ".env"
 LOG_PATH = BASE_DIR / "tg-watchbot.log"
+FONTS_DIR = BASE_DIR / "fonts"
+PANEL_FONT_FILES = {
+    "rhr-cn-400.woff2": "font/woff2",
+    "rhr-cn-700.woff2": "font/woff2",
+}
 MIN_INTERVAL_SECONDS = 1
 DEFAULT_MONITOR_INTERVAL_SECONDS = 30
 DEFAULT_MONITOR_MESSAGE_DELETE_AFTER_MINUTES = 60
@@ -3526,7 +3531,7 @@ def theme_interaction_script() -> str:
 
 
 def panel_path_is_public(path: str) -> bool:
-    return path in PUBLIC_PANEL_PATHS
+    return path in PUBLIC_PANEL_PATHS or path.startswith("/fonts/")
 
 
 def verification_page_html(
@@ -3557,8 +3562,10 @@ def verification_page_html(
 <script nonce="{safe_csp_nonce}" src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" defer></script>
 <style nonce="{safe_csp_nonce}">
 :root{{color-scheme:light dark;--ink:#5a4670;--ink-soft:#7d6a96;--muted:#9d8cb8;--pink:#ff86b3;--pink-deep:#f668a0;--pink-soft:#ffd9e8;--lilac:#b8a3f5;--sky:#8fcdf7;--mint:#5fd6ae;--card:rgba(255,255,255,.85);--line:rgba(184,163,245,.5)}}
+@font-face{{font-family:"RHR CN";src:url("/fonts/rhr-cn-400.woff2") format("woff2");font-weight:400;font-style:normal;font-display:swap}}
+@font-face{{font-family:"RHR CN";src:url("/fonts/rhr-cn-700.woff2") format("woff2");font-weight:700;font-style:normal;font-display:swap}}
 *{{box-sizing:border-box}}
-body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;background:linear-gradient(160deg,#ffe6f2 0%,#f3e9ff 48%,#e0f1ff 100%);color:var(--ink);font-family:"Yuanti SC","YouYuan","Hiragino Maru Gothic ProN","PingFang SC","Microsoft YaHei UI","Microsoft YaHei",ui-sans-serif,sans-serif}}
+body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;background:linear-gradient(160deg,#ffe6f2 0%,#f3e9ff 48%,#e0f1ff 100%);color:var(--ink);font-family:"RHR CN","Yuanti SC","YouYuan","Hiragino Maru Gothic ProN","PingFang SC","Microsoft YaHei UI","Microsoft YaHei",ui-sans-serif,sans-serif}}
 main{{position:relative;width:min(440px,100%);padding:32px 26px 26px;border:3px solid rgba(255,255,255,.95);border-radius:32px;background:var(--card);box-shadow:0 24px 60px rgba(196,148,220,.35),inset 0 1px 0 rgba(255,255,255,.9);overflow:hidden}}
 main:before{{content:"";position:absolute;top:0;left:0;right:0;height:8px;background:linear-gradient(90deg,var(--pink),var(--lilac),var(--sky))}}
 h1{{margin:0 0 10px;font-size:26px;font-weight:800;background:linear-gradient(120deg,var(--pink-deep),var(--lilac) 70%);background-clip:text;-webkit-background-clip:text;color:transparent}}
@@ -3720,6 +3727,7 @@ def apply_verification_security_headers(response: Response, csp_nonce: str = "")
             "default-src 'none'; "
             f"script-src 'nonce-{csp_nonce}' https://telegram.org https://challenges.cloudflare.com; "
             f"style-src 'nonce-{csp_nonce}'; "
+            "font-src 'self'; "
             "frame-src https://challenges.cloudflare.com; "
             "connect-src 'self' https://challenges.cloudflare.com; "
             "img-src data: https:; "
@@ -3744,8 +3752,10 @@ def login_page(error: str = "") -> str:
 <style>
 :root{{color-scheme:light;--ink:#5a4670;--ink-soft:#7d6a96;--muted:#9d8cb8;--pink:#ff86b3;--pink-deep:#f668a0;--pink-soft:#ffd9e8;--lilac:#b8a3f5;--lilac-soft:#ece4ff;--sky:#8fcdf7;--mint:#5fd6ae;--card:rgba(255,255,255,.82);--line:rgba(184,163,245,.5);--shadow:0 24px 60px rgba(196,148,220,.35);--ease:cubic-bezier(.34,1.56,.64,1)}}
 html[data-theme='dark']{{color-scheme:dark;--ink:#f0e9ff;--ink-soft:#cbbde6;--muted:#a493c4;--card:rgba(46,36,74,.78);--line:rgba(184,163,245,.45);--shadow:0 24px 60px rgba(10,6,28,.55)}}
+@font-face{{font-family:"RHR CN";src:url("/fonts/rhr-cn-400.woff2") format("woff2");font-weight:400;font-style:normal;font-display:swap}}
+@font-face{{font-family:"RHR CN";src:url("/fonts/rhr-cn-700.woff2") format("woff2");font-weight:700;font-style:normal;font-display:swap}}
 *{{box-sizing:border-box}}
-body{{margin:0;min-height:100vh;font-family:"Yuanti SC","YouYuan","Hiragino Maru Gothic ProN","PingFang SC","Microsoft YaHei UI","Microsoft YaHei",ui-sans-serif,sans-serif;background:linear-gradient(160deg,#ffe6f2 0%,#f3e9ff 48%,#e0f1ff 100%);color:var(--ink);display:grid;place-items:center;padding:24px;overflow:hidden}}
+body{{margin:0;min-height:100vh;font-family:"RHR CN","Yuanti SC","YouYuan","Hiragino Maru Gothic ProN","PingFang SC","Microsoft YaHei UI","Microsoft YaHei",ui-sans-serif,sans-serif;background:linear-gradient(160deg,#ffe6f2 0%,#f3e9ff 48%,#e0f1ff 100%);color:var(--ink);display:grid;place-items:center;padding:24px;overflow:hidden}}
 body:before{{content:"";position:fixed;inset:auto auto -90px -70px;width:260px;height:260px;border-radius:50%;background:radial-gradient(circle,rgba(255,134,179,.45),transparent 70%);z-index:-1;animation:floatA 5.5s ease-in-out infinite alternate}}
 body:after{{content:"";position:fixed;top:40px;right:6vw;width:190px;height:190px;border-radius:50%;background:radial-gradient(circle,rgba(143,205,247,.45),transparent 70%);z-index:-1;animation:floatB 6.5s ease-in-out infinite alternate}}
 .login-card{{position:relative;width:min(420px,100%);padding:38px 32px 32px;border:3px solid rgba(255,255,255,.95);border-radius:32px;background:var(--card);backdrop-filter:blur(18px);box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.9);overflow:hidden;animation:cardIn .28s var(--ease)}}
@@ -4208,8 +4218,10 @@ def layout(title: str, body: str) -> str:
 <style>
 :root{{color-scheme:light;--ink:#5a4670;--ink-soft:#7d6a96;--muted:#9d8cb8;--pink:#ff86b3;--pink-deep:#f668a0;--pink-soft:#ffd9e8;--lilac:#b8a3f5;--lilac-deep:#8b76d6;--lilac-soft:#ece4ff;--sky:#8fcdf7;--sky-soft:#d9f2ff;--mint:#5fd6ae;--mint-soft:#e2f7ef;--card:rgba(255,255,255,.82);--line:rgba(184,163,245,.5);--shadow:0 24px 60px rgba(196,148,220,.35);--ease:cubic-bezier(.34,1.56,.64,1)}}
 html[data-theme='dark']{{color-scheme:dark;--ink:#f0e9ff;--ink-soft:#cbbde6;--muted:#a493c4;--card:rgba(46,36,74,.78);--line:rgba(184,163,245,.45);--shadow:0 24px 60px rgba(10,6,28,.55)}}
+@font-face{{font-family:"RHR CN";src:url("/fonts/rhr-cn-400.woff2") format("woff2");font-weight:400;font-style:normal;font-display:swap}}
+@font-face{{font-family:"RHR CN";src:url("/fonts/rhr-cn-700.woff2") format("woff2");font-weight:700;font-style:normal;font-display:swap}}
 *{{box-sizing:border-box}}
-body{{font-family:"Yuanti SC","YouYuan","Hiragino Maru Gothic ProN","PingFang SC","Microsoft YaHei UI","Microsoft YaHei",ui-sans-serif,sans-serif;background:linear-gradient(160deg,#ffe6f2 0%,#f3e9ff 48%,#e0f1ff 100%) fixed;color:var(--ink);margin:0;letter-spacing:0;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}}
+body{{font-family:"RHR CN","Yuanti SC","YouYuan","Hiragino Maru Gothic ProN","PingFang SC","Microsoft YaHei UI","Microsoft YaHei",ui-sans-serif,sans-serif;background:linear-gradient(160deg,#ffe6f2 0%,#f3e9ff 48%,#e0f1ff 100%) fixed;color:var(--ink);margin:0;letter-spacing:0;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}}
 body:before{{content:"";position:fixed;right:-90px;top:-70px;width:300px;height:300px;border-radius:50%;background:radial-gradient(circle,rgba(255,134,179,.4),transparent 70%);z-index:-1;animation:floatA 7s ease-in-out infinite alternate}}
 body:after{{content:"";position:fixed;left:170px;bottom:-100px;width:280px;height:280px;border-radius:50%;background:radial-gradient(circle,rgba(143,205,247,.4),transparent 70%);z-index:-1;animation:floatB 8s ease-in-out infinite alternate}}
 a{{color:var(--pink-deep);text-decoration:none}}
@@ -5549,6 +5561,18 @@ async function logoutTgSession() {{
     @app.get("/health", response_class=PlainTextResponse)
     async def health() -> str:
         return "ok"
+
+    @app.get("/fonts/{filename}")
+    async def panel_font(filename: str):
+        media_type = PANEL_FONT_FILES.get(filename)
+        font_path = FONTS_DIR / filename
+        if media_type is None or not font_path.is_file():
+            raise HTTPException(status_code=404, detail="font not found")
+        return FileResponse(
+            font_path,
+            media_type=media_type,
+            headers={"Cache-Control": "public, max-age=604800, immutable"},
+        )
 
     # ---- Channel Media Monitoring Routes ----
 
