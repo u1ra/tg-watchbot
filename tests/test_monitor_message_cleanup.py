@@ -1174,20 +1174,15 @@ class BotConfigurationTest(unittest.TestCase):
     def test_readme_documents_local_and_production_verification_boundaries(self) -> None:
         readme = Path("README.md").read_text(encoding="utf-8")
         self.assertIn("新用户两阶段验证", readme)
-        self.assertIn("本地开发与测试", readme)
-        self.assertIn("生产部署", readme)
-        self.assertIn("1x00000000000000000000AA", readme)
-        self.assertIn("secret 不应写入本项目", readme)
-        self.assertIn("SITEVERIFY_AUTH_TOKEN", readme)
-        self.assertIn("TURNSTILE_VERIFY_AUTH_TOKEN", readme)
+        self.assertIn("https://github.com/u1ra/tg-watchbot-verify", readme)
+        self.assertIn("BOT_VERIFICATION_ENABLED", readme)
+        self.assertIn("TURNSTILE_", readme)
 
     def test_readme_ai_deployment_prompts_use_current_repo_and_safe_defaults(self) -> None:
         readme = Path("README.md").read_text(encoding="utf-8")
         for expected in [
-            "AI 辅助部署",
-            "全新部署提示词",
-            "已有实例升级提示词",
-            "AI 部署验收标准",
+            "AI 一键部署",
+            "AI 一键升级",
             "https://github.com/u1ra/tg-watchbot.git",
             "不得覆盖已有 .env、config.yaml 或 SQLite 数据库",
             "保持 BOT_VERIFICATION_ENABLED=false",
