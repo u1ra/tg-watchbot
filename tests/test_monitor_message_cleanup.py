@@ -148,12 +148,21 @@ import app
 class FakeBot:
     def __init__(self) -> None:
         self.deleted: list[tuple[int, int]] = []
+        self.edited_reply_markups: list[tuple[int, int, object]] = []
         self.sent_texts: list[str] = []
         self.sent_chat_ids: list[int] = []
         self.fail_chat_ids: set[int] = set()
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))
+
+    async def edit_message_reply_markup(
+        self,
+        chat_id: int,
+        message_id: int,
+        reply_markup=None,
+    ) -> None:
+        self.edited_reply_markups.append((chat_id, message_id, reply_markup))
 
     async def send_message(self, chat_id: int, text: str, disable_web_page_preview: bool = False):
         if chat_id in self.fail_chat_ids:
@@ -564,6 +573,9 @@ class PrivateVerificationGateTest(unittest.TestCase):
         button = markup.inline_keyboard[0][0]
         self.assertEqual("开始人机验证", button.text)
         self.assertTrue(button.web_app.url.startswith("https://verify.example.test/verify/telegram?nonce="))
+        verification = app.get_user_verification(3001)
+        self.assertEqual(3001, verification["turnstile_prompt_chat_id"])
+        self.assertEqual(6001, verification["turnstile_prompt_message_id"])
         with closing(sqlite3.connect(app.DB_PATH)) as conn:
             inbox_count = conn.execute("SELECT COUNT(*) FROM inbox_messages").fetchone()[0]
         self.assertEqual(0, inbox_count)
@@ -769,9 +781,70 @@ class TurnstileVerificationTest(unittest.TestCase):
         self.assertIn('data-action="turnstile-spin-v1"', page)
         self.assertIn('"turnstile-spin-v1"', page)
         self.assertIn('"test-site-key"', page)
+        self.assertIn('fetch("/api/verify/status"', page)
         self.assertIn('fetch("/api/verify/turnstile"', page)
         self.assertIn('"safe_nonce-123"', page)
         self.assertNotIn("123456:test-token", page)
+
+    def test_preflight_returns_current_state_before_checking_stale_nonce(self) -> None:
+        app.upsert_user(4001, "Test User", "testuser")
+        challenge = app.begin_turnstile_verification(4001, now_ts=1000)
+        init_data = self.signed_init_data(4001, auth_date=1000)
+
+        ready = app.telegram_verification_status(
+            init_data,
+            challenge["nonce"],
+            now_ts=1001,
+        )
+        expired = app.telegram_verification_status(
+            init_data,
+            "wrong-nonce",
+            now_ts=1001,
+        )
+        app.advance_turnstile_to_math(4001, challenge["nonce"], now_ts=1002)
+        pending_math = app.telegram_verification_status(
+            init_data,
+            "old-nonce",
+            now_ts=1003,
+        )
+        answer = str(app.get_user_verification(4001)["math_answer"])
+        app.submit_math_verification(4001, answer, now_ts=1004)
+        verified = app.telegram_verification_status(
+            init_data,
+            "old-nonce",
+            now_ts=1005,
+        )
+
+        self.assertEqual({"ok": True, "status": "pending_turnstile"}, ready)
+        self.assertEqual(
+            {"ok": False, "error": "invalid-or-expired-challenge"},
+            expired,
+        )
+        self.assertEqual({"ok": True, "status": "pending_math"}, pending_math)
+        self.assertEqual({"ok": True, "status": "verified"}, verified)
+
+    def test_preflight_rejects_unsigned_or_blocked_users(self) -> None:
+        app.upsert_user(4001, "Test User", "testuser")
+        challenge = app.begin_turnstile_verification(4001, now_ts=1000)
+        init_data = self.signed_init_data(4001, auth_date=1000)
+
+        self.assertEqual(
+            {"ok": False, "error": "invalid-telegram-session"},
+            app.telegram_verification_status(
+                "unsigned",
+                challenge["nonce"],
+                now_ts=1001,
+            ),
+        )
+        app.set_block(4001, True)
+        self.assertEqual(
+            {"ok": False, "error": "invalid-user"},
+            app.telegram_verification_status(
+                init_data,
+                challenge["nonce"],
+                now_ts=1001,
+            ),
+        )
 
     def test_configuration_fails_closed_and_test_mode_is_loopback_only(self) -> None:
         settings = app.verification_settings()
@@ -799,6 +872,14 @@ class TurnstileVerificationTest(unittest.TestCase):
     def test_turnstile_success_advances_once_and_sends_math_question(self) -> None:
         app.upsert_user(4001, "Test User", "testuser")
         challenge = app.begin_turnstile_verification(4001, now_ts=1000)
+        self.assertTrue(
+            app.record_turnstile_prompt(
+                4001,
+                challenge["nonce"],
+                4001,
+                7001,
+            )
+        )
         init_data = self.signed_init_data(4001, auth_date=1000)
         old_verify = app.verify_turnstile_token
         fake_bot = FakeBot()
@@ -838,6 +919,10 @@ class TurnstileVerificationTest(unittest.TestCase):
         self.assertEqual("pending_math", app.get_user_verification(4001)["status"])
         self.assertEqual([4001], fake_bot.sent_chat_ids)
         self.assertIn("第二阶段算数题", fake_bot.sent_texts[0])
+        self.assertEqual([(4001, 7001, None)], fake_bot.edited_reply_markups)
+        verification = app.get_user_verification(4001)
+        self.assertIsNone(verification["turnstile_prompt_chat_id"])
+        self.assertIsNone(verification["turnstile_prompt_message_id"])
 
     def test_concurrent_success_callbacks_only_send_one_math_question(self) -> None:
         app.upsert_user(4001, "Test User", "testuser")
@@ -1058,6 +1143,7 @@ class TurnstileVerificationTest(unittest.TestCase):
 
     def test_public_routes_are_exact_and_security_headers_are_strict(self) -> None:
         self.assertTrue(app.panel_path_is_public("/verify/telegram"))
+        self.assertTrue(app.panel_path_is_public("/api/verify/status"))
         self.assertTrue(app.panel_path_is_public("/api/verify/turnstile"))
         self.assertFalse(app.panel_path_is_public("/verify/telegram/anything"))
         response = SimpleNamespace(headers={})
@@ -1111,7 +1197,9 @@ class TurnstileVerificationTest(unittest.TestCase):
     def test_panel_api_maps_callback_result_and_rejects_oversized_body(self) -> None:
         panel = app.create_panel_app()
         api_route = panel.routes[("POST", "/api/verify/turnstile")]
+        status_route = panel.routes[("POST", "/api/verify/status")]
         old_complete = app.complete_turnstile_verification
+        old_status = app.telegram_verification_status
 
         async def accepted(*args, **kwargs):
             return {"ok": True, "question_sent": True}
@@ -1123,6 +1211,10 @@ class TurnstileVerificationTest(unittest.TestCase):
             cookies={},
         )
         app.complete_turnstile_verification = accepted
+        app.telegram_verification_status = lambda *args, **kwargs: {
+            "ok": True,
+            "status": "verified",
+        }
         try:
             response = asyncio.run(
                 api_route(
@@ -1132,10 +1224,23 @@ class TurnstileVerificationTest(unittest.TestCase):
                     "turnstile-token",
                 )
             )
+            status_response = asyncio.run(
+                status_route(
+                    request,
+                    "signed-init-data",
+                    "safe_nonce-123",
+                )
+            )
         finally:
             app.complete_turnstile_verification = old_complete
+            app.telegram_verification_status = old_status
         self.assertEqual(200, response.status_code)
         self.assertEqual({"ok": True, "question_sent": True}, response.content)
+        self.assertEqual(200, status_response.status_code)
+        self.assertEqual(
+            {"ok": True, "status": "verified"},
+            status_response.content,
+        )
 
         oversized_request = SimpleNamespace(
             client=SimpleNamespace(host="127.0.0.1"),

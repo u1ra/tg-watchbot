@@ -98,6 +98,11 @@ PUBLIC_PANEL_PATHS = {
     "/health",
     "/favicon.ico",
     "/verify/telegram",
+    "/api/verify/status",
+    "/api/verify/turnstile",
+}
+VERIFICATION_API_PATHS = {
+    "/api/verify/status",
     "/api/verify/turnstile",
 }
 
@@ -271,6 +276,8 @@ def init_db() -> None:
                 status TEXT NOT NULL,
                 turnstile_nonce_hash TEXT,
                 turnstile_expires_at REAL,
+                turnstile_prompt_chat_id INTEGER,
+                turnstile_prompt_message_id INTEGER,
                 math_question TEXT,
                 math_answer INTEGER,
                 math_attempts INTEGER NOT NULL DEFAULT 0,
@@ -356,6 +363,8 @@ def init_db() -> None:
             "ALTER TABLE telegram_login_sessions ADD COLUMN user_id TEXT DEFAULT ''",
             "ALTER TABLE telegram_login_sessions ADD COLUMN phone TEXT DEFAULT ''",
             "ALTER TABLE telegram_login_sessions ADD COLUMN status TEXT DEFAULT 'empty'",
+            "ALTER TABLE user_verifications ADD COLUMN turnstile_prompt_chat_id INTEGER",
+            "ALTER TABLE user_verifications ADD COLUMN turnstile_prompt_message_id INTEGER",
         ]:
             try:
                 conn.execute(sql)
@@ -588,6 +597,78 @@ def turnstile_session_is_valid(user_id: int, nonce: str, now_ts: float | None = 
         str(row["turnstile_nonce_hash"]),
         verification_nonce_hash(nonce),
     )
+
+
+def record_turnstile_prompt(
+    user_id: int,
+    nonce: str,
+    chat_id: int,
+    message_id: int,
+) -> bool:
+    if not nonce or not chat_id or not message_id:
+        return False
+    with closing(db()) as conn:
+        changed = conn.execute(
+            """
+            UPDATE user_verifications
+            SET turnstile_prompt_chat_id=?,
+                turnstile_prompt_message_id=?,
+                updated_at=?
+            WHERE user_id=?
+              AND status='pending_turnstile'
+              AND turnstile_nonce_hash=?
+            """,
+            (
+                int(chat_id),
+                int(message_id),
+                now_iso(),
+                user_id,
+                verification_nonce_hash(nonce),
+            ),
+        ).rowcount
+        conn.commit()
+    return changed == 1
+
+
+async def disable_turnstile_prompt(user_id: int, target_bot: Any = None) -> bool:
+    row = get_user_verification(user_id)
+    if not row:
+        return False
+    chat_id = row["turnstile_prompt_chat_id"]
+    message_id = row["turnstile_prompt_message_id"]
+    if not chat_id or not message_id:
+        return False
+    editor = target_bot or bot
+    if not editor:
+        return False
+    try:
+        await editor.edit_message_reply_markup(
+            chat_id=int(chat_id),
+            message_id=int(message_id),
+            reply_markup=None,
+        )
+    except Exception:
+        logger.warning(
+            "failed to disable verification prompt user_id=%s message_id=%s",
+            user_id,
+            message_id,
+        )
+        return False
+    with closing(db()) as conn:
+        conn.execute(
+            """
+            UPDATE user_verifications
+            SET turnstile_prompt_chat_id=NULL,
+                turnstile_prompt_message_id=NULL,
+                updated_at=?
+            WHERE user_id=?
+              AND turnstile_prompt_chat_id=?
+              AND turnstile_prompt_message_id=?
+            """,
+            (now_iso(), user_id, int(chat_id), int(message_id)),
+        )
+        conn.commit()
+    return True
 
 
 def advance_turnstile_to_math(
@@ -979,6 +1060,50 @@ def verification_api_rate_limited(
     return len(bucket) > limit
 
 
+def telegram_verification_status(
+    init_data: str,
+    nonce: str,
+    now_ts: float | None = None,
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    values = settings or verification_settings()
+    config_error = turnstile_configuration_error(values)
+    if config_error:
+        return {"ok": False, "error": "verification-unavailable"}
+    identity = validate_telegram_init_data(
+        init_data,
+        os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+        max_age_seconds=int(values["initdata_max_age_seconds"]),
+        now_ts=now_ts,
+    )
+    if not identity:
+        return {"ok": False, "error": "invalid-telegram-session"}
+    user_id = int(identity["user_id"])
+    user = get_user(user_id)
+    if not user or is_blocked(user_id):
+        return {"ok": False, "error": "invalid-user"}
+
+    current_ts = time.time() if now_ts is None else float(now_ts)
+    row = normalize_user_verification(user_id, current_ts)
+    if row and row["status"] == "verified":
+        return {"ok": True, "status": "verified"}
+    if row and row["status"] == "pending_math":
+        return {"ok": True, "status": "pending_math"}
+    if row and row["status"] == "cooldown":
+        retry_after = max(
+            1,
+            int(float(row["cooldown_until"] or current_ts) - current_ts),
+        )
+        return {
+            "ok": True,
+            "status": "cooldown",
+            "retry_after": retry_after,
+        }
+    if turnstile_session_is_valid(user_id, nonce, now_ts=current_ts):
+        return {"ok": True, "status": "pending_turnstile"}
+    return {"ok": False, "error": "invalid-or-expired-challenge"}
+
+
 async def complete_turnstile_verification(
     init_data: str,
     nonce: str,
@@ -1023,6 +1148,7 @@ async def complete_turnstile_verification(
     )
     if not math:
         return {"ok": False, "error": "challenge-already-used"}
+    await disable_turnstile_prompt(user_id)
     question_sent = False
     if bot:
         try:
@@ -2491,6 +2617,7 @@ async def send_turnstile_verification_prompt(
             f"上一条人机验证入口仍有效（约 {remaining} 秒），请使用上一条消息中的按钮。"
         )
         return
+    await disable_turnstile_prompt(user_id)
     try:
         challenge = begin_turnstile_verification(
             user_id,
@@ -2508,11 +2635,17 @@ async def send_turnstile_verification_prompt(
         logger.error("verification public URL is missing or not HTTPS")
         await message.answer("人机验证暂不可用，请稍后再试。")
         return
-    await message.answer(
+    sent = await message.answer(
         "首次联系需要完成两阶段人机验证。\n"
         "第一步：点击下方按钮完成 Cloudflare Turnstile；完成后我会发送一道算数题。\n"
         "验证前发送的消息不会保存，请在验证成功后重新发送。",
         reply_markup=markup,
+    )
+    record_turnstile_prompt(
+        user_id,
+        str(challenge["nonce"]),
+        int(message.chat.id),
+        int(sent.message_id),
     )
 
 
@@ -2558,6 +2691,7 @@ async def handle_private_verification_gate(
         )
         outcome = result["result"]
         if outcome == "verified":
+            await disable_turnstile_prompt(uid)
             await message.answer("验证成功。请重新发送你刚才想发送的消息。")
         elif outcome == "invalid":
             await message.answer(
@@ -3460,6 +3594,73 @@ p{{line-height:1.7;color:var(--ink-soft)}}
     statusBox.classList.toggle("pending", Boolean(pending));
   }}
 
+  function finishWithoutTurnstile(message, closeDelay) {{
+    document.getElementById("widget").hidden = true;
+    show(message, false);
+    if (tg && closeDelay) {{
+      setTimeout(function () {{ tg.close(); }}, closeDelay);
+    }}
+  }}
+
+  function renderWidget() {{
+    if (!window.turnstile) {{
+      show("验证组件加载失败，请检查网络后重试。", false);
+      return;
+    }}
+    widgetId = window.turnstile.render("#widget", {{
+      sitekey: siteKey,
+      action: expectedAction,
+      callback: submitToken,
+      "expired-callback": function () {{ submitting = false; show("验证已过期，请重新操作。", false); }},
+      "error-callback": function () {{ submitting = false; show("验证组件暂时不可用，请稍后重试。", false); }}
+    }});
+    show("请完成下方 Cloudflare 验证。", false);
+  }}
+
+  async function preflight() {{
+    if (!tg || !tg.initData) {{
+      finishWithoutTurnstile("请从 Telegram 机器人发送的验证按钮打开此页面。", 0);
+      return;
+    }}
+    var body = new URLSearchParams();
+    body.set("init_data", tg.initData);
+    body.set("nonce", challengeNonce);
+    try {{
+      var response = await fetch("/api/verify/status", {{
+        method: "POST",
+        credentials: "same-origin",
+        headers: {{"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"}},
+        body: body.toString()
+      }});
+      var result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || "verification-failed");
+      if (result.status === "verified") {{
+        finishWithoutTurnstile("你已完成认证，无需再次验证。", 1200);
+        return;
+      }}
+      if (result.status === "pending_math") {{
+        finishWithoutTurnstile("第一阶段已完成，请返回 Telegram 回答算数题。", 1800);
+        return;
+      }}
+      if (result.status === "cooldown") {{
+        finishWithoutTurnstile(
+          "验证正在冷却，请约 " + String(result.retry_after || 1) + " 秒后重试。",
+          0
+        );
+        return;
+      }}
+      if (result.status !== "pending_turnstile") throw new Error("invalid-status");
+      renderWidget();
+    }} catch (error) {{
+      finishWithoutTurnstile(
+        error && error.message === "invalid-or-expired-challenge"
+          ? "验证入口已过期，请返回 Telegram 重新获取。"
+          : "暂时无法确认认证状态，请稍后重试。",
+        0
+      );
+    }}
+  }}
+
   async function submitToken(token) {{
     if (submitting) return;
     if (!tg || !tg.initData) {{
@@ -3500,18 +3701,7 @@ p{{line-height:1.7;color:var(--ink-soft)}}
     tg.expand();
   }}
   window.addEventListener("load", function () {{
-    if (!window.turnstile) {{
-      show("验证组件加载失败，请检查网络后重试。", false);
-      return;
-    }}
-    widgetId = window.turnstile.render("#widget", {{
-      sitekey: siteKey,
-      action: expectedAction,
-      callback: submitToken,
-      "expired-callback": function () {{ submitting = false; show("验证已过期，请重新操作。", false); }},
-      "error-callback": function () {{ submitting = false; show("验证组件暂时不可用，请稍后重试。", false); }}
-    }});
-    show("请完成下方 Cloudflare 验证。", false);
+    preflight();
   }});
 }})();
 </script>
@@ -4202,7 +4392,7 @@ def create_panel_app() -> FastAPI:
     @app.middleware("http")
     async def require_login_middleware(request: Request, call_next):
         path = request.url.path
-        if path == "/api/verify/turnstile":
+        if path in VERIFICATION_API_PATHS:
             content_length = request.headers.get("content-length", "")
             try:
                 if content_length and int(content_length) > 16384:
@@ -4215,7 +4405,7 @@ def create_panel_app() -> FastAPI:
                 )
         if panel_path_is_public(path) or is_logged_in(request):
             response = await call_next(request)
-            if path in {"/verify/telegram", "/api/verify/turnstile"}:
+            if path == "/verify/telegram" or path in VERIFICATION_API_PATHS:
                 apply_verification_security_headers(response)
             return response
         return RedirectResponse("/login", status_code=303)
@@ -4302,6 +4492,39 @@ def create_panel_app() -> FastAPI:
             "turnstile-failed": 400,
             "turnstile-hostname-mismatch": 400,
             "turnstile-action-mismatch": 400,
+        }
+        return JSONResponse(
+            result,
+            status_code=200 if result.get("ok") else error_statuses.get(str(result.get("error")), 400),
+        )
+
+    @app.post("/api/verify/status")
+    async def telegram_verification_preflight(
+        request: Request,
+        init_data: str = Form(""),
+        nonce: str = Form(""),
+    ) -> Response:
+        client_ip = request_client_ip(request)
+        if len(init_data) > 8192 or len(nonce) > 128:
+            return JSONResponse(
+                {"ok": False, "error": "invalid-request"},
+                status_code=400,
+            )
+        session_rate_key = hashlib.sha256(init_data.encode("utf-8")).hexdigest()[:24]
+        if (
+            verification_api_rate_limited(f"ip:{client_ip}", max_requests=120)
+            or verification_api_rate_limited(f"session:{session_rate_key}")
+        ):
+            return JSONResponse(
+                {"ok": False, "error": "rate-limited"},
+                status_code=429,
+            )
+        result = telegram_verification_status(init_data, nonce)
+        error_statuses = {
+            "verification-unavailable": 503,
+            "invalid-telegram-session": 401,
+            "invalid-user": 401,
+            "invalid-or-expired-challenge": 409,
         }
         return JSONResponse(
             result,
